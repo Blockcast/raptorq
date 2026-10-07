@@ -40,6 +40,10 @@ harness = false
 name = "decode_benchmark"
 harness = false
 
+[[bench]]
+name = "reusable_encode_benchmark"
+harness = false
+
 
 [[bench]]
 name = "roundtrip_benchmark"
