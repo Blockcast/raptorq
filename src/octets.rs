@@ -1104,7 +1104,7 @@ mod tests {
     use crate::octet::Octet;
     use crate::octets::mulassign_scalar;
     use crate::octets::{
-        BinaryOctetVec, fused_addassign_mul_scalar, fused_addassign_mul_scalar_binary,
+        BinaryOctetVec, add_assign, fused_addassign_mul_scalar, fused_addassign_mul_scalar_binary,
     };
 
     #[test]
@@ -1176,5 +1176,97 @@ mod tests {
         fused_addassign_mul_scalar_binary(&mut data, &binary_octet_vec, &scalar);
 
         assert!(data.is_empty());
+    }
+
+    // Every length from 0 to 300 crosses each kernel's vector width (16, 32, 64
+    // bytes), its scalar tail, and, for the binary kernel, every padding offset
+    // in the first word plus whole words that are zero, sparse or full. Each
+    // dispatched kernel (whichever SIMD path this target selects) must match
+    // plain GF(256) arithmetic byte for byte.
+    #[test]
+    fn kernels_match_reference_all_lengths() {
+        let mut rng = rand::rng();
+        for size in 0..=300usize {
+            for _ in 0..4 {
+                let scalar = Octet::new(rng.random_range(2..=255));
+                let data1: Vec<u8> = (0..size).map(|_| rng.random()).collect();
+                let data2: Vec<u8> = (0..size).map(|_| rng.random()).collect();
+
+                let mut got = data1.clone();
+                add_assign(&mut got, &data2);
+                let expected: Vec<u8> = data1.iter().zip(&data2).map(|(a, b)| a ^ b).collect();
+                assert_eq!(expected, got, "add_assign size={size}");
+
+                let mut got = data1.clone();
+                mulassign_scalar(&mut got, &scalar);
+                let expected: Vec<u8> = data1
+                    .iter()
+                    .map(|a| (&Octet::new(*a) * &scalar).byte())
+                    .collect();
+                assert_eq!(expected, got, "mulassign_scalar size={size}");
+
+                let mut got = data1.clone();
+                fused_addassign_mul_scalar(&mut got, &data2, &scalar);
+                let expected: Vec<u8> = data1
+                    .iter()
+                    .zip(&data2)
+                    .map(|(a, b)| (Octet::new(*a) + &Octet::new(*b) * &scalar).byte())
+                    .collect();
+                assert_eq!(expected, got, "fused_addassign_mul_scalar size={size}");
+
+                if size == 0 {
+                    continue;
+                }
+                for density in [0u8, 1, 2, 3] {
+                    let words: Vec<u64> = (0..size.div_ceil(64))
+                        .map(|_| match density {
+                            0 => 0,
+                            1 => 1u64 << rng.random_range(0..64),
+                            2 => rng.random(),
+                            _ => u64::MAX,
+                        })
+                        .collect();
+                    let bits = BinaryOctetVec::new(words, size);
+                    let unpacked = bits.to_octet_vec();
+                    for scalar in [Octet::one(), scalar.clone()] {
+                        let mut got = data1.clone();
+                        fused_addassign_mul_scalar_binary(&mut got, &bits, &scalar);
+                        let expected: Vec<u8> = data1
+                            .iter()
+                            .zip(&unpacked)
+                            .map(|(a, b)| (Octet::new(*a) + &Octet::new(*b) * &scalar).byte())
+                            .collect();
+                        assert_eq!(
+                            expected, got,
+                            "fused_addassign_mul_scalar_binary size={size} density={density}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // The nibble tables must be right for every scalar, not just a random one.
+    #[test]
+    fn mul_kernels_every_scalar() {
+        let data1: Vec<u8> = (0..=255u8).chain(0..=255u8).rev().collect();
+        let data2: Vec<u8> = (0..=255u8).chain(0..=255u8).collect();
+        for s in 2..=255u8 {
+            let scalar = Octet::new(s);
+            let mut got = data1.clone();
+            mulassign_scalar(&mut got, &scalar);
+            for (g, a) in got.iter().zip(&data1) {
+                assert_eq!(*g, (&Octet::new(*a) * &scalar).byte(), "scalar={s}");
+            }
+            let mut got = data1.clone();
+            fused_addassign_mul_scalar(&mut got, &data2, &scalar);
+            for ((g, a), b) in got.iter().zip(&data1).zip(&data2) {
+                assert_eq!(
+                    *g,
+                    (Octet::new(*a) + &Octet::new(*b) * &scalar).byte(),
+                    "scalar={s}"
+                );
+            }
+        }
     }
 }
