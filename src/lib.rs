@@ -63,7 +63,9 @@ pub use crate::python::Decoder;
 pub use crate::python::Encoder;
 #[cfg(feature = "python")]
 pub use crate::python::raptorq;
-pub use crate::systematic_constants::extended_source_block_symbols;
+pub use crate::systematic_constants::{
+    MAX_SOURCE_SYMBOLS_PER_BLOCK, extended_source_block_symbols,
+};
 
 #[cfg(feature = "benchmarking")]
 pub use crate::constraint_matrix::generate_constraint_matrix;
