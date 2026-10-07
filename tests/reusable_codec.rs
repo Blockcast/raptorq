@@ -348,6 +348,27 @@ fn plan_memo_keeps_one_plan_per_extended_size_within_its_budget() {
     assert_eq!(encoder.plan_memo_len(), 1);
 }
 
+#[test]
+fn source_symbol_borrows_the_loaded_block() {
+    let mut rng = Rng::new(13);
+    for (t, n, al) in [(16u16, 1u16, 8u8), (24, 3, 4)] {
+        let cfg = config(t, n, al);
+        let mut encoder = ReusableSourceBlockEncoder::new(&cfg).unwrap();
+        assert_eq!(encoder.source_symbol(0), None);
+        for k in [9u32, 4] {
+            let data = rng.bytes(k as usize * t as usize - 3);
+            encoder.encode_block(&data, k).unwrap();
+            let reference = reference_symbols(&cfg, &data, k, 0, None);
+            for i in 0..k {
+                assert_eq!(encoder.source_symbol(i), Some(&reference[i as usize][..]));
+            }
+            assert_eq!(encoder.source_symbol(k), None);
+        }
+        encoder.clear();
+        assert_eq!(encoder.source_symbol(0), None);
+    }
+}
+
 /// Every source symbol of a K-symbol block, then `repair` repair symbols.
 fn block_symbols(
     cfg: &ObjectTransmissionInformation,

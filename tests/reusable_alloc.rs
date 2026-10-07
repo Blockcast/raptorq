@@ -194,6 +194,23 @@ fn reserved_planless_encoder_does_not_allocate_on_its_first_block() {
 }
 
 #[test]
+fn source_symbol_does_not_allocate() {
+    for (k, t, _) in GEOMETRIES {
+        let mut encoder = planned_encoder(k, t);
+        encoder
+            .encode_block(&block(3, k as usize * t as usize), k)
+            .unwrap();
+        let mut sum = 0u64;
+        let n = steady_state_allocs(|_| {
+            for i in 0..k {
+                sum += u64::from(encoder.source_symbol(i).unwrap()[0]);
+            }
+        });
+        assert_eq!(n, 0, "k={k} {sum}");
+    }
+}
+
+#[test]
 fn repair_range_into_does_not_allocate() {
     for (k, t, r) in GEOMETRIES {
         let mut encoder = planned_encoder(k, t);

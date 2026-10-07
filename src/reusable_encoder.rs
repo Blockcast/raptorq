@@ -213,6 +213,13 @@ impl ReusableSourceBlockEncoder {
         Ok(())
     }
 
+    /// Source symbol `index` of the loaded block, borrowed from the
+    /// encoder: the same bytes [`repair_into`](Self::repair_into) writes for
+    /// ESI `index`. `None` when no block is loaded or `index >= K`.
+    pub fn source_symbol(&self, index: u32) -> Option<&[u8]> {
+        (index < self.source_symbols).then(|| self.source.get(index as usize))
+    }
+
     /// Load a new source block of `source_symbols` (K) symbols and compute
     /// its intermediate symbols, replacing the loaded block.
     ///
