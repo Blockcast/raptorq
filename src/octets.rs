@@ -50,6 +50,17 @@ impl BinaryOctetVec {
         self.length
     }
 
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "std"))]
+    pub(crate) fn elements(&self) -> &[u64] {
+        &self.elements
+    }
+
+    // Unused by the wasm SIMD128 build, whose binary kernel reads the packed bits
+    // directly instead of materializing them.
+    #[cfg(any(
+        test,
+        not(all(target_arch = "wasm32", target_feature = "simd128", feature = "std"))
+    ))]
     fn to_octet_vec(&self) -> Vec<u8> {
         let mut word = 0;
         let mut bit = self.padding_bits();
@@ -128,12 +139,23 @@ pub fn fused_addassign_mul_scalar_binary(
         //     }
         // }
     }
+    // wasm has no runtime feature detection: SIMD128 is a compile-time choice,
+    // so the scalar path below is compiled out when it is enabled.
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "std"))]
+    {
+        return crate::octets_simd128::fused_addassign_mul_scalar_binary_simd128(
+            octets, other, scalar,
+        );
+    }
 
-    // TODO: write an optimized fallback that does call .to_octet_vec()
-    if *scalar == Octet::one() {
-        return add_assign(octets, &other.to_octet_vec());
-    } else {
-        return fused_addassign_mul_scalar(octets, &other.to_octet_vec(), scalar);
+    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128", feature = "std")))]
+    {
+        // TODO: write an optimized fallback that does call .to_octet_vec()
+        if *scalar == Octet::one() {
+            return add_assign(octets, &other.to_octet_vec());
+        } else {
+            return fused_addassign_mul_scalar(octets, &other.to_octet_vec(), scalar);
+        }
     }
 }
 
@@ -470,7 +492,7 @@ unsafe fn add_assign_avx512(octets: &mut [u8], other: &[u8]) {
     }
 }
 
-fn mulassign_scalar_fallback(octets: &mut [u8], scalar: &Octet) {
+pub(crate) fn mulassign_scalar_fallback(octets: &mut [u8], scalar: &Octet) {
     let scalar_index = usize::from(scalar.byte());
     for item in octets {
         let octet_index = usize::from(*item);
@@ -654,11 +676,16 @@ pub fn mulassign_scalar(octets: &mut [u8], scalar: &Octet) {
         //     }
         // }
     }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "std"))]
+    {
+        return crate::octets_simd128::mulassign_scalar_simd128(octets, scalar);
+    }
 
+    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128", feature = "std")))]
     return mulassign_scalar_fallback(octets, scalar);
 }
 
-fn fused_addassign_mul_scalar_fallback(octets: &mut [u8], other: &[u8], scalar: &Octet) {
+pub(crate) fn fused_addassign_mul_scalar_fallback(octets: &mut [u8], other: &[u8], scalar: &Octet) {
     let scalar_index = scalar.byte() as usize;
     for (i, octet) in octets.iter_mut().enumerate() {
         unsafe {
@@ -875,11 +902,16 @@ pub fn fused_addassign_mul_scalar(octets: &mut [u8], other: &[u8], scalar: &Octe
         //     }
         // }
     }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "std"))]
+    {
+        return crate::octets_simd128::fused_addassign_mul_scalar_simd128(octets, other, scalar);
+    }
 
+    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128", feature = "std")))]
     return fused_addassign_mul_scalar_fallback(octets, other, scalar);
 }
 
-fn add_assign_fallback(octets: &mut [u8], other: &[u8]) {
+pub(crate) fn add_assign_fallback(octets: &mut [u8], other: &[u8]) {
     assert_eq!(octets.len(), other.len());
     let self_ptr = octets.as_mut_ptr();
     let other_ptr = other.as_ptr();
@@ -1092,6 +1124,12 @@ pub fn add_assign(octets: &mut [u8], other: &[u8]) {
         //     }
         // }
     }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "std"))]
+    {
+        return crate::octets_simd128::add_assign_simd128(octets, other);
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128", feature = "std")))]
     return add_assign_fallback(octets, other);
 }
 

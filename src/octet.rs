@@ -71,10 +71,18 @@ const OCT_LOG: [u8; 256] = [
 pub static OCTET_MUL: [[u8; 256]; 256] = calculate_octet_mul_table();
 
 // See "Screaming Fast Galois Field Arithmetic Using Intel SIMD Instructions" by Plank et al.
-// Further adapted to AVX2
+// Further adapted to AVX2. wasm32 uses the tables only with SIMD128 enabled.
 #[cfg(any(feature = "std", test))]
+#[cfg_attr(
+    all(target_arch = "wasm32", not(target_feature = "simd128")),
+    allow(dead_code)
+)]
 pub const OCTET_MUL_HI_BITS: [[u8; 32]; 256] = calculate_octet_mul_hi_table();
 #[cfg(any(feature = "std", test))]
+#[cfg_attr(
+    all(target_arch = "wasm32", not(target_feature = "simd128")),
+    allow(dead_code)
+)]
 pub const OCTET_MUL_LOW_BITS: [[u8; 32]; 256] = calculate_octet_mul_low_table();
 
 const fn const_mul(x: usize, y: usize) -> u8 {
@@ -82,6 +90,10 @@ const fn const_mul(x: usize, y: usize) -> u8 {
 }
 
 #[cfg(any(feature = "std", test))]
+#[cfg_attr(
+    all(target_arch = "wasm32", not(target_feature = "simd128")),
+    allow(dead_code)
+)]
 const fn calculate_octet_mul_hi_table() -> [[u8; 32]; 256] {
     let mut result = [[0; 32]; 256];
     let mut i = 1;
@@ -98,6 +110,10 @@ const fn calculate_octet_mul_hi_table() -> [[u8; 32]; 256] {
 }
 
 #[cfg(any(feature = "std", test))]
+#[cfg_attr(
+    all(target_arch = "wasm32", not(target_feature = "simd128")),
+    allow(dead_code)
+)]
 const fn calculate_octet_mul_low_table() -> [[u8; 32]; 256] {
     let mut result = [[0; 32]; 256];
     let mut i = 1;

@@ -30,6 +30,8 @@ mod octet_matrix;
 mod octets;
 #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "std"))]
 mod octets_gfni;
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "std"))]
+mod octets_simd128;
 mod operation_vector;
 mod pi_solver;
 #[cfg(feature = "python")]
