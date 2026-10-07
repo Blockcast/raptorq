@@ -184,6 +184,55 @@ impl SymbolSlab {
         self.mapping = Some(order);
     }
 
+    /// Make this an all-zero slab of `count` symbols of `symbol_size` bytes,
+    /// reusing the existing allocation when it is large enough. Returns the
+    /// reorder mapping that was active, so the caller can reuse its storage.
+    pub(crate) fn reset_zeroed(&mut self, count: usize, symbol_size: usize) -> Option<Vec<usize>> {
+        assert!(symbol_size > 0, "symbol_size must be non-zero");
+        self.data.clear();
+        self.data.resize(count * symbol_size, 0);
+        self.count = count;
+        self.symbol_size = symbol_size;
+        self.mapping.take()
+    }
+
+    /// Reserve capacity for at least `count` symbols in total, without
+    /// changing the contents.
+    pub(crate) fn reserve_symbols(&mut self, count: usize) {
+        let bytes = count * self.symbol_size;
+        if bytes > self.data.len() {
+            self.data.reserve(bytes - self.data.len());
+        }
+    }
+
+    /// Grow or shrink to `count` symbols, keeping the contents of the first
+    /// `min(count, len)` symbols; new symbols are zero. Requires no active
+    /// mapping.
+    pub(crate) fn resize_symbols(&mut self, count: usize) {
+        assert!(
+            self.mapping.is_none(),
+            "resize_symbols called with active mapping"
+        );
+        self.data.resize(count * self.symbol_size, 0);
+        self.count = count;
+    }
+
+    /// Like [`SymbolSlab::set_reorder`], but hands back the mapping it
+    /// replaces so the caller can reuse its storage.
+    pub(crate) fn replace_reorder(&mut self, order: Vec<usize>) -> Option<Vec<usize>> {
+        self.mapping.replace(order)
+    }
+
+    /// Mutable access to the raw bytes. Requires no active mapping.
+    #[inline]
+    pub(crate) fn as_bytes_mut(&mut self) -> &mut [u8] {
+        assert!(
+            self.mapping.is_none(),
+            "as_bytes_mut called with active mapping"
+        );
+        &mut self.data
+    }
+
     /// Bulk copy from a contiguous source block into the slab at the given offset.
     /// `source` must be `count * symbol_size` bytes.
     #[allow(dead_code)]

@@ -36,6 +36,9 @@ mod operation_vector;
 mod pi_solver;
 #[cfg(feature = "python")]
 mod python;
+mod reusable;
+mod reusable_decoder;
+mod reusable_encoder;
 mod rng;
 mod sparse_matrix;
 mod sparse_vec;
@@ -63,6 +66,9 @@ pub use crate::python::Decoder;
 pub use crate::python::Encoder;
 #[cfg(feature = "python")]
 pub use crate::python::raptorq;
+pub use crate::reusable::BlockError;
+pub use crate::reusable_decoder::ReusableSourceBlockDecoder;
+pub use crate::reusable_encoder::ReusableSourceBlockEncoder;
 pub use crate::systematic_constants::{
     MAX_SOURCE_SYMBOLS_PER_BLOCK, extended_source_block_symbols,
 };

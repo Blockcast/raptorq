@@ -34,6 +34,18 @@ In order, oldest first:
    `ec2334b`). The fec-raptorq C bindings use it to reject an oversized block
    before the encoder asserts.
 4. This file.
+5. **Reusable block codec** (`src/reusable*.rs`): `ReusableSourceBlockEncoder`,
+   `ReusableSourceBlockDecoder` and `BlockError`. This API is additive: the
+   existing types are untouched. An encoder is refilled block after block,
+   and a decoder is reset block after block, keeping their storage. Symbols
+   go into caller buffers (`repair_into`, `repair_range_into`,
+   `copy_block_into`). The decoder deduplicates by ESI and does not solve
+   again until a new symbol arrives. It is the crate side of the fec-raptorq
+   zero-allocation batched FFI. Tests: `tests/reusable_codec.rs`
+   (differential and reuse) and `tests/reusable_alloc.rs` (steady-state
+   allocation counts). Supporting changes: `SourceBlockEncodingPlan::cached(K)`
+   (upstream's process-wide plan cache) and `source_symbol_count()`, plus
+   crate-private `SymbolSlab` helpers that reshape a slab in place.
 
 The old vendored copy also had some dead-code removals in `arraymap.rs`,
 `matrix.rs`, `sparse_matrix.rs` and `sparse_vec.rs`: `size_in_bytes` was gated

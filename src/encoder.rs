@@ -179,6 +179,29 @@ pub struct SourceBlockEncodingPlan {
 }
 
 impl SourceBlockEncodingPlan {
+    /// The process-wide cached plan for `symbol_count` source symbols,
+    /// generating and inserting it on a miss.
+    ///
+    /// This is the cache [`SourceBlockEncoder::new`] uses: it is shared by
+    /// every encoder in the process and holds at most 64 plans (first in,
+    /// first out). Callers that see many distinct block sizes, such as the
+    /// short final block of each object, should fetch only the plans they
+    /// reuse (for example, the full-block size) and encode the rest without
+    /// a plan.
+    #[cfg(feature = "std")]
+    pub fn cached(symbol_count: u16) -> Arc<SourceBlockEncodingPlan> {
+        get_or_generate_source_block_encoding_plan(symbol_count)
+    }
+
+    /// The number of source symbols this plan encodes.
+    pub fn source_symbol_count(&self) -> u16 {
+        self.source_symbol_count
+    }
+
+    pub(crate) fn operations(&self) -> &[SymbolOps] {
+        &self.operations
+    }
+
     // Generates an encoding plan that is valid for any combination of data length and symbol size
     // where ceil(data_length / symbol_size) = symbol_count
     pub fn generate(symbol_count: u16) -> SourceBlockEncodingPlan {
@@ -407,7 +430,7 @@ fn create_d(source_block: &SymbolSlab, symbol_size: usize) -> SymbolSlab {
 
 // See section 5.3.3.4
 #[allow(non_snake_case)]
-fn gen_intermediate_symbols(
+pub(crate) fn gen_intermediate_symbols(
     source_block: &SymbolSlab,
     symbol_size: usize,
     sparse_threshold: u32,
@@ -445,7 +468,7 @@ fn gen_intermediate_symbols_with_plan(
 // Allocation-free Enc[] function, as defined in section 5.3.5.3.
 // Writes the encoded symbol directly into `dest`.
 #[allow(clippy::many_single_char_names)]
-fn enc_into(
+pub(crate) fn enc_into(
     dest: &mut [u8],
     source_block_symbols: u32,
     intermediate_symbols: &SymbolSlab,
