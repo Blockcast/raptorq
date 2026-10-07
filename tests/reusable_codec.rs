@@ -110,7 +110,8 @@ fn check_encode(cfg: &ObjectTransmissionInformation, data: &[u8], k: u32, repair
         "planned k={k}"
     );
 
-    // A plan for another size is not used: the block is solved directly.
+    // A plan for another size: used if it has the same K', otherwise the
+    // encoder generates its own.
     let other = Arc::new(SourceBlockEncodingPlan::generate(k as u16 + 1));
     let mut mismatched = ReusableSourceBlockEncoder::with_plan(cfg, other).unwrap();
     mismatched.encode_block(data, k).unwrap();
@@ -253,6 +254,98 @@ fn short_block_with_full_block_plan_attached() {
         let reference = reference_symbols(&cfg, &data, k, 26, None);
         assert_eq!(new_range(&encoder, 0, k + 26), reference, "k={k}");
     }
+}
+
+/// A plan encodes every K with its extended size K': one plan generated for
+/// K = 50 encodes 50..=55 (K' = 55), and the encoder generates nothing.
+#[test]
+fn plan_covers_every_k_with_the_same_extended_size() {
+    let cfg = config(32, 1, 8);
+    let mut rng = Rng::new(11);
+    let plan = Arc::new(SourceBlockEncodingPlan::generate(50));
+    let mut encoder = ReusableSourceBlockEncoder::with_plan(&cfg, plan).unwrap();
+    for k in [55u32, 50, 52, 54, 51, 53] {
+        let data = rng.bytes(k as usize * 32 - 5);
+        encoder.encode_block(&data, k).unwrap();
+        assert_eq!(
+            new_range(&encoder, 0, k + 10),
+            reference_symbols(&cfg, &data, k, 10, None),
+            "k={k}"
+        );
+    }
+    assert_eq!(encoder.plan_memo_len(), 0);
+    // K = 49 has K' = 49: not covered, so the encoder generates a plan.
+    let data = rng.bytes(49 * 32);
+    encoder.encode_block(&data, 49).unwrap();
+    assert_eq!(
+        new_range(&encoder, 0, 59),
+        reference_symbols(&cfg, &data, 49, 10, None)
+    );
+    assert_eq!(encoder.plan_memo_len(), 1);
+}
+
+/// The plan memo keeps one plan per K', within its byte budget, and every
+/// arm (attached plan, memo hit, kept miss, transient miss) encodes the
+/// same symbols as `SourceBlockEncoder`.
+#[test]
+fn plan_memo_keeps_one_plan_per_extended_size_within_its_budget() {
+    let cfg = config(16, 1, 8);
+    let mut rng = Rng::new(12);
+    let check = |encoder: &mut ReusableSourceBlockEncoder, rng: &mut Rng, k: u32| {
+        let data = rng.bytes(k as usize * 16 - 1);
+        encoder.encode_block(&data, k).unwrap();
+        assert_eq!(
+            new_range(encoder, 0, k + 8),
+            reference_symbols(&cfg, &data, k, 8, None),
+            "k={k}"
+        );
+    };
+
+    let mut encoder = ReusableSourceBlockEncoder::new(&cfg).unwrap();
+    assert_eq!(
+        encoder.plan_memo_limit(),
+        ReusableSourceBlockEncoder::DEFAULT_PLAN_MEMO_BYTES
+    );
+    // K' = 55, 10, 138, 55, 10, 12: three distinct K' plus 12.
+    for k in [51u32, 3, 128, 55, 10, 12] {
+        check(&mut encoder, &mut rng, k);
+    }
+    assert_eq!(encoder.plan_memo_len(), 4);
+    let all = encoder.plan_memo_bytes();
+    assert!(all > 0 && all <= encoder.plan_memo_limit());
+
+    // Lowering the budget drops the largest K' first: 138 goes.
+    encoder.set_plan_memo_limit(all - 1);
+    assert_eq!(encoder.plan_memo_len(), 3);
+    let three = encoder.plan_memo_bytes();
+    assert!(three < all);
+    // 128 no longer fits next to the other three: used once, not kept, and
+    // nothing is evicted for it.
+    check(&mut encoder, &mut rng, 128);
+    assert_eq!(encoder.plan_memo_len(), 3);
+    assert_eq!(encoder.plan_memo_bytes(), three);
+    // The remaining sizes are memo hits.
+    for k in [49u32, 55, 1, 12] {
+        check(&mut encoder, &mut rng, k);
+    }
+    assert_eq!(encoder.plan_memo_len(), 4, "49 has its own K'");
+
+    // A zero budget keeps nothing; every block is still correct.
+    encoder.set_plan_memo_limit(0);
+    assert_eq!((encoder.plan_memo_len(), encoder.plan_memo_bytes()), (0, 0));
+    for k in [51u32, 51, 7] {
+        check(&mut encoder, &mut rng, k);
+    }
+    assert_eq!(encoder.plan_memo_len(), 0);
+
+    // reserve() fills the memo up front.
+    encoder.set_plan_memo_limit(ReusableSourceBlockEncoder::DEFAULT_PLAN_MEMO_BYTES);
+    encoder.reserve(20).unwrap();
+    assert_eq!(encoder.plan_memo_len(), 1);
+    encoder.reserve(19).unwrap();
+    assert_eq!(encoder.plan_memo_len(), 1, "19 and 20 share K' = 20");
+    check(&mut encoder, &mut rng, 19);
+    assert_eq!(encoder.plan_memo_len(), 1);
 }
 
 /// Every source symbol of a K-symbol block, then `repair` repair symbols.

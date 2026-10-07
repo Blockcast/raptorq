@@ -46,6 +46,15 @@ In order, oldest first:
    allocation counts). Supporting changes: `SourceBlockEncodingPlan::cached(K)`
    (upstream's process-wide plan cache) and `source_symbol_count()`, plus
    crate-private `SymbolSlab` helpers that reshape a slab in place.
+   The encoder encodes every block by replaying a plan for the block's
+   extended size K' into its own storage (a plan depends only on K', so one
+   plan serves every K with that K'). Plans come from the attached plan or
+   from a per-encoder memo that keeps the plan it generates for each new K'
+   (byte budget, 4 MiB by default, never evicts; the process-wide cache is
+   not touched). Encoding and symbol generation therefore allocate nothing
+   once each K' has been seen, including the short final block of every
+   object. `benches/reusable_encode_benchmark.rs` times encode + repair at
+   K=128, T=1344.
 
 The old vendored copy also had some dead-code removals in `arraymap.rs`,
 `matrix.rs`, `sparse_matrix.rs` and `sparse_vec.rs`: `size_in_bytes` was gated

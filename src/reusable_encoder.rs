@@ -5,9 +5,7 @@ use std::{sync::Arc, vec::Vec};
 
 use crate::base::ObjectTransmissionInformation;
 use crate::base::intermediate_tuple;
-use crate::encoder::{
-    SPARSE_MATRIX_THRESHOLD, SourceBlockEncodingPlan, enc_into, gen_intermediate_symbols,
-};
+use crate::encoder::{SourceBlockEncodingPlan, enc_into};
 use crate::operation_vector::{SymbolOps, perform_op};
 use crate::reusable::{BlockError, ESI_LIMIT, SubBlockLayout, check_source_symbols, strided_len};
 use crate::symbol_slab::SymbolSlab;
@@ -26,10 +24,32 @@ use crate::systematic_constants::{
 /// block. Once its storage has grown to the largest block it sees, encoding
 /// a block with the attached plan and generating symbols do not allocate.
 ///
-/// The encoder holds at most one [`SourceBlockEncodingPlan`], for the block
-/// size it encodes most often (typically the full block of a stream). A
-/// block of that size is encoded with the plan; any other size is solved
-/// directly, without generating or caching a plan for it.
+/// Every block is encoded by replaying a [`SourceBlockEncodingPlan`] for its
+/// extended size K' (RFC 6330 section 5.3.1) into the encoder's own
+/// storage. A plan depends only on K', so it serves every K with that K'.
+/// The plan comes from, in order:
+///
+/// 1. the attached plan ([`with_plan`](Self::with_plan) or
+///    [`set_plan`](Self::set_plan)), typically the full block's from
+///    [`SourceBlockEncodingPlan::cached`];
+/// 2. the encoder's plan memo: plans it generated itself for earlier
+///    blocks, such as the short final blocks of a stream;
+/// 3. otherwise, the encoder solves the block's constraint matrix once to
+///    generate the plan (this allocates) and keeps it in the memo if it fits
+///    the memo's byte budget ([`set_plan_memo_limit`](Self::set_plan_memo_limit),
+///    [`DEFAULT_PLAN_MEMO_BYTES`](Self::DEFAULT_PLAN_MEMO_BYTES) by default).
+///    A plan that does not fit is used once and dropped; the memo never
+///    evicts.
+///
+/// The memo is private to the encoder: the process-wide plan cache is never
+/// read or written. Its size is bounded by the number of distinct K' values
+/// RFC 6330 defines up to the largest block encoded. A stream of 128-symbol
+/// blocks (K' = 138) has short final blocks of 27 distinct K' (10 to 127),
+/// whose plans take about 1.7 MB together.
+///
+/// So once the storage has grown to the largest block it sees and each K'
+/// it sees has a plan, encoding a block and generating symbols do not
+/// allocate.
 ///
 /// ```
 /// use raptorq::{ObjectTransmissionInformation, ReusableSourceBlockEncoder};
@@ -54,9 +74,22 @@ pub struct ReusableSourceBlockEncoder {
     /// blocks.
     spare_order: Vec<usize>,
     plan: Option<Arc<SourceBlockEncodingPlan>>,
+    /// K' of the attached plan; 0 when none is attached.
+    plan_extended: u32,
+    /// Plans this encoder generated, as `(K', plan)` sorted by K'.
+    memo: Vec<(u32, Arc<SourceBlockEncodingPlan>)>,
+    /// The heap bytes of the plans in `memo`.
+    memo_bytes: usize,
+    /// The byte budget of `memo`.
+    memo_limit: usize,
 }
 
 impl ReusableSourceBlockEncoder {
+    /// The default byte budget of the plan memo, 4 MiB: enough for a plan
+    /// for every K' up to 217 (4,102,832 bytes), which covers every short
+    /// block of a stream of blocks of up to 218 symbols.
+    pub const DEFAULT_PLAN_MEMO_BYTES: usize = 4 << 20;
+
     /// Create an encoder with no block loaded.
     ///
     /// Only the symbol size, sub-block count and symbol alignment of `config`
@@ -76,31 +109,66 @@ impl ReusableSourceBlockEncoder {
             intermediate: SymbolSlab::with_zeros(0, layout.symbol_size()),
             spare_order: Vec::new(),
             plan: None,
+            plan_extended: 0,
+            memo: Vec::new(),
+            memo_bytes: 0,
+            memo_limit: Self::DEFAULT_PLAN_MEMO_BYTES,
             layout,
         })
     }
 
-    /// Create an encoder with no block loaded that encodes blocks of
-    /// `plan.source_symbol_count()` symbols with `plan`. See
+    /// Create an encoder with no block loaded that encodes blocks with the
+    /// extended size K' of `plan.source_symbol_count()` with `plan`. See
     /// [`new`](Self::new) for `config` and the errors.
     pub fn with_plan(
         config: &ObjectTransmissionInformation,
         plan: Arc<SourceBlockEncodingPlan>,
     ) -> Result<Self, BlockError> {
         let mut encoder = Self::new(config)?;
-        encoder.plan = Some(plan);
+        encoder.set_plan(Some(plan));
         Ok(encoder)
     }
 
     /// Attach `plan`, replacing any plan already attached, or detach it with
     /// `None`. This does not change the loaded block.
     pub fn set_plan(&mut self, plan: Option<Arc<SourceBlockEncodingPlan>>) {
+        self.plan_extended = plan.as_ref().map_or(0, |plan| {
+            extended_source_block_symbols(u32::from(plan.source_symbol_count()))
+        });
         self.plan = plan;
     }
 
     /// The attached plan, if any.
     pub fn plan(&self) -> Option<&Arc<SourceBlockEncodingPlan>> {
         self.plan.as_ref()
+    }
+
+    /// Set the byte budget of the plan memo (see the type documentation).
+    /// Plans already in the memo are dropped, largest K' first, until the
+    /// memo fits; 0 empties the memo and stops it from keeping plans.
+    pub fn set_plan_memo_limit(&mut self, bytes: usize) {
+        self.memo_limit = bytes;
+        while self.memo_bytes > bytes {
+            match self.memo.pop() {
+                Some((_, plan)) => self.memo_bytes -= plan.heap_bytes(),
+                None => break,
+            }
+        }
+    }
+
+    /// The byte budget of the plan memo.
+    pub fn plan_memo_limit(&self) -> usize {
+        self.memo_limit
+    }
+
+    /// The number of plans in the memo.
+    pub fn plan_memo_len(&self) -> usize {
+        self.memo.len()
+    }
+
+    /// The heap bytes held by the plans in the memo.
+    pub fn plan_memo_bytes(&self) -> usize {
+        self.memo_bytes
     }
 
     /// The symbol size T in bytes.
@@ -121,8 +189,10 @@ impl ReusableSourceBlockEncoder {
         self.source_symbols = 0;
     }
 
-    /// Grow the storage to hold a block of `source_symbols` symbols now, so
-    /// that encoding the first block of that size does not allocate.
+    /// Prepare for a block of `source_symbols` symbols now, so that
+    /// encoding the first block of that size does not allocate: grow the
+    /// storage and, if no plan covers its K', generate one into the memo
+    /// (when it fits the memo's budget).
     ///
     /// # Errors
     /// [`BlockError::InvalidSourceSymbols`] if `source_symbols` is zero or
@@ -134,6 +204,11 @@ impl ReusableSourceBlockEncoder {
         self.intermediate.reserve_symbols(l);
         if self.spare_order.capacity() < l {
             self.spare_order.reserve(l - self.spare_order.len());
+        }
+        let extended = extended_source_block_symbols(source_symbols);
+        if !self.has_plan_for(extended) {
+            let plan = Self::generate_plan(source_symbols);
+            self.remember(extended, plan);
         }
         Ok(())
     }
@@ -149,9 +224,9 @@ impl ReusableSourceBlockEncoder {
     /// more than one sub-block, `data` is in block order (RFC 6330 section
     /// 4.4.1.2), as for `SourceBlockEncoder`.
     ///
-    /// If a plan is attached and `plan.source_symbol_count() == K`, the plan
-    /// is used; otherwise the block is solved directly. Both give the same
-    /// symbols.
+    /// The block is encoded with the plan for its K' (see the type
+    /// documentation). Every plan gives the same symbols as
+    /// `SourceBlockEncoder`.
     ///
     /// # Errors
     /// - [`BlockError::InvalidSourceSymbols`] if K is zero or above
@@ -183,40 +258,28 @@ impl ReusableSourceBlockEncoder {
                 });
         }
 
-        let plan = self
-            .plan
-            .as_ref()
-            .filter(|plan| u32::from(plan.source_symbol_count()) == source_symbols);
-        if let Some(plan) = plan {
-            // D: S + H zero rows, the K source symbols, then zero padding up to
-            // K' (section 5.3.3.4), transformed in place by the plan.
-            let l = num_intermediate_symbols(source_symbols) as usize;
-            let s = num_ldpc_symbols(source_symbols) as usize;
-            let h = num_hdpc_symbols(source_symbols) as usize;
-            if let Some(order) = self.intermediate.reset_zeroed(l, symbol_size) {
-                self.spare_order = order;
+        let extended = extended_source_block_symbols(source_symbols);
+        let mut transient = None;
+        if !self.has_plan_for(extended) {
+            // The only allocating step: generate the plan for this K' (one
+            // solve) and keep it if the memo has room.
+            let plan = Self::generate_plan(source_symbols);
+            if !self.remember(extended, Arc::clone(&plan)) {
+                transient = Some(plan);
             }
-            self.intermediate
-                .copy_block_from(s + h, self.source.as_bytes());
-            for op in plan.operations() {
-                match op {
-                    SymbolOps::Reorder { order } => {
-                        let mut mapping = core::mem::take(&mut self.spare_order);
-                        mapping.clear();
-                        mapping.extend_from_slice(order);
-                        if let Some(previous) = self.intermediate.replace_reorder(mapping) {
-                            self.spare_order = previous;
-                        }
-                    }
-                    op => perform_op(op, &mut self.intermediate),
-                }
-            }
-        } else {
-            let (intermediate, _) =
-                gen_intermediate_symbols(&self.source, symbol_size, SPARSE_MATRIX_THRESHOLD);
-            self.intermediate = intermediate
-                .expect("the RFC 6330 constraint matrix of a source block is always invertible");
         }
+        let plan = match transient.as_deref() {
+            Some(plan) => plan,
+            None => find_plan(&self.plan, self.plan_extended, &self.memo, extended)
+                .expect("a plan covers this K'"),
+        };
+        load_intermediate(
+            plan.operations(),
+            source_symbols,
+            &self.source,
+            &mut self.intermediate,
+            &mut self.spare_order,
+        );
         self.source_symbols = source_symbols;
         Ok(())
     }
@@ -286,6 +349,34 @@ impl ReusableSourceBlockEncoder {
         Ok(())
     }
 
+    fn has_plan_for(&self, extended: u32) -> bool {
+        find_plan(&self.plan, self.plan_extended, &self.memo, extended).is_some()
+    }
+
+    fn generate_plan(source_symbols: u32) -> Arc<SourceBlockEncodingPlan> {
+        // K <= MAX_SOURCE_SYMBOLS_PER_BLOCK (56403) fits a u16.
+        let mut plan = SourceBlockEncodingPlan::generate(source_symbols as u16);
+        plan.shrink_to_fit();
+        Arc::new(plan)
+    }
+
+    /// Keep `plan` for blocks of size `extended` if it fits the memo's
+    /// budget. Returns whether it was kept.
+    fn remember(&mut self, extended: u32, plan: Arc<SourceBlockEncodingPlan>) -> bool {
+        let bytes = plan.heap_bytes();
+        if self.memo_bytes.saturating_add(bytes) > self.memo_limit {
+            return false;
+        }
+        match self.memo.binary_search_by_key(&extended, |&(k, _)| k) {
+            Ok(_) => false,
+            Err(i) => {
+                self.memo.insert(i, (extended, plan));
+                self.memo_bytes += bytes;
+                true
+            }
+        }
+    }
+
     fn check_output(&self, count: usize, out_len: usize, stride: usize) -> Result<(), BlockError> {
         if self.source_symbols == 0 {
             return Err(BlockError::NoBlock);
@@ -310,5 +401,104 @@ impl ReusableSourceBlockEncoder {
         let tuple =
             intermediate_tuple(isi, num_lt_symbols(k), systematic_index(k), calculate_p1(k));
         enc_into(dest, k, &self.intermediate, tuple);
+    }
+}
+
+/// The plan for blocks with extended size `extended`: the attached one if it
+/// covers that K', else the memo's.
+fn find_plan<'a>(
+    attached: &'a Option<Arc<SourceBlockEncodingPlan>>,
+    attached_extended: u32,
+    memo: &'a [(u32, Arc<SourceBlockEncodingPlan>)],
+    extended: u32,
+) -> Option<&'a SourceBlockEncodingPlan> {
+    match attached {
+        Some(plan) if attached_extended == extended => Some(plan),
+        _ => memo
+            .binary_search_by_key(&extended, |&(k, _)| k)
+            .ok()
+            .map(|i| &*memo[i].1),
+    }
+}
+
+/// Compute the L intermediate symbols of a K-symbol block into
+/// `intermediate` by replaying `operations`, a plan for the block's K'
+/// (section 5.3.3.4): D is S + H zero symbols, the K source symbols, then
+/// zero padding up to K'. Reuses the storage of `intermediate` and
+/// `spare_order`; allocates only when they must grow.
+fn load_intermediate(
+    operations: &[SymbolOps],
+    source_symbols: u32,
+    source: &SymbolSlab,
+    intermediate: &mut SymbolSlab,
+    spare_order: &mut Vec<usize>,
+) {
+    let l = num_intermediate_symbols(source_symbols) as usize;
+    let s = num_ldpc_symbols(source_symbols) as usize;
+    let h = num_hdpc_symbols(source_symbols) as usize;
+    if let Some(order) = intermediate.reset_zeroed(l, source.symbol_size()) {
+        *spare_order = order;
+    }
+    intermediate.copy_block_from(s + h, source.as_bytes());
+    for op in operations {
+        match op {
+            SymbolOps::Reorder { order } => {
+                let mut mapping = core::mem::take(spare_order);
+                mapping.clear();
+                mapping.extend_from_slice(order);
+                if let Some(previous) = intermediate.replace_reorder(mapping) {
+                    *spare_order = previous;
+                }
+            }
+            op => perform_op(op, intermediate),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::encoder::SourceBlockEncodingPlan;
+    use crate::systematic_constants::{
+        SYSTEMATIC_INDICES_AND_PARAMETERS, extended_source_block_symbols,
+    };
+
+    /// The reason one plan serves every K with the same K': the operations
+    /// are identical. Checked for every K up to 400 (the dense and sparse
+    /// solvers) in release builds; debug builds, where plan generation is
+    /// slow, check K up to 60 and the first sparse K' (257).
+    #[test]
+    fn plan_operations_depend_only_on_the_extended_size() {
+        let ks: &[core::ops::RangeInclusive<u32>] = if cfg!(debug_assertions) {
+            &[1..=60, 250..=257]
+        } else {
+            &[1..=400]
+        };
+        let mut previous: Option<(u32, SourceBlockEncodingPlan)> = None;
+        for k in ks.iter().cloned().flatten() {
+            let extended = extended_source_block_symbols(k);
+            let plan = SourceBlockEncodingPlan::generate(k as u16);
+            if let Some((prev_extended, prev)) = &previous
+                && *prev_extended == extended
+            {
+                assert_eq!(plan.operations(), prev.operations(), "k={k}");
+                continue;
+            }
+            assert!(
+                SYSTEMATIC_INDICES_AND_PARAMETERS
+                    .iter()
+                    .any(|&(kp, ..)| kp == extended)
+            );
+            previous = Some((extended, plan));
+        }
+    }
+
+    #[test]
+    fn shrunk_plan_reports_its_heap_bytes() {
+        let mut plan = SourceBlockEncodingPlan::generate(128);
+        let before = plan.heap_bytes();
+        plan.shrink_to_fit();
+        let after = plan.heap_bytes();
+        assert!(after < before, "{after} < {before}");
+        assert!(after >= core::mem::size_of_val(plan.operations()));
     }
 }

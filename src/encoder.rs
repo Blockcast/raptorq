@@ -202,8 +202,32 @@ impl SourceBlockEncodingPlan {
         &self.operations
     }
 
+    /// Release the spare capacity of the operation list. The solver sizes it
+    /// for the worst case (70 operations per intermediate symbol), roughly
+    /// three times what a plan uses.
+    pub(crate) fn shrink_to_fit(&mut self) {
+        self.operations.shrink_to_fit();
+    }
+
+    /// The heap bytes this plan holds: its operation list and the reorder
+    /// mappings in it.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        let mappings: usize = self
+            .operations
+            .iter()
+            .map(|op| match op {
+                SymbolOps::Reorder { order } => order.capacity() * core::mem::size_of::<usize>(),
+                _ => 0,
+            })
+            .sum();
+        self.operations.capacity() * core::mem::size_of::<SymbolOps>() + mappings
+    }
+
     // Generates an encoding plan that is valid for any combination of data length and symbol size
-    // where ceil(data_length / symbol_size) = symbol_count
+    // where ceil(data_length / symbol_size) = symbol_count.
+    // The operations depend only on the extended source block size K' of symbol_count (section
+    // 5.3.1): the constraint matrix and the L intermediate symbols are those of K', so a plan
+    // also encodes every other symbol count with the same K'.
     pub fn generate(symbol_count: u16) -> SourceBlockEncodingPlan {
         // TODO: refactor pi_solver, so that we don't need this dummy data to generate a plan
         let symbols = SymbolSlab::with_zeros(symbol_count as usize, 1);
@@ -430,7 +454,7 @@ fn create_d(source_block: &SymbolSlab, symbol_size: usize) -> SymbolSlab {
 
 // See section 5.3.3.4
 #[allow(non_snake_case)]
-pub(crate) fn gen_intermediate_symbols(
+fn gen_intermediate_symbols(
     source_block: &SymbolSlab,
     symbol_size: usize,
     sparse_threshold: u32,

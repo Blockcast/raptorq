@@ -4,9 +4,8 @@
 //! A counting global allocator counts the allocations (alloc, alloc_zeroed,
 //! realloc) of the measuring thread only, so tests running in parallel do
 //! not disturb each other. Tests marked `#[ignore = "zero-alloc internals
-//! pending"]` cover the paths that still run the allocating RFC 6330 solver
-//! (`gen_intermediate_symbols` without a plan, and the decoder's solve);
-//! they are the targets for the zero-allocation internals.
+//! pending"]` cover the decoder's solve, which still runs the allocating
+//! RFC 6330 solver; it is the target for the zero-allocation internals.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -119,8 +118,9 @@ fn reserved_encoder_does_not_allocate_on_its_first_block() {
     assert_eq!(ALLOCS.with(|n| n.get()), 0);
 }
 
+/// No plan attached: the first block of each K' generates a plan into the
+/// encoder's memo, and later blocks replay it.
 #[test]
-#[ignore = "zero-alloc internals pending"]
 fn encode_block_without_plan_does_not_allocate() {
     for (k, t, _) in GEOMETRIES {
         let blocks: Vec<Vec<u8>> = (0..13).map(|i| block(i, k as usize * t as usize)).collect();
@@ -130,10 +130,9 @@ fn encode_block_without_plan_does_not_allocate() {
     }
 }
 
-/// A short block (K' < K) with the full block's plan attached: solved
-/// without a plan.
+/// A short block (K' < K) with the full block's plan attached: encoded with
+/// the plan the encoder generated for it on the first such block.
 #[test]
-#[ignore = "zero-alloc internals pending"]
 fn encode_short_block_does_not_allocate() {
     for (k, t, _) in GEOMETRIES {
         let short = k / 2 - 1;
@@ -144,6 +143,54 @@ fn encode_short_block_does_not_allocate() {
         let n = steady_state_allocs(|i| encoder.encode_block(&blocks[i], short).unwrap());
         assert_eq!(n, 0, "k={k} short={short}");
     }
+}
+
+/// The interleaved sender's pattern: full blocks with the cached plan and,
+/// at the end of each object, a short block of any size. Once every size
+/// has been seen, no block allocates, whatever the order.
+#[test]
+fn every_short_block_size_does_not_allocate_once_seen() {
+    let (k, t, r) = GEOMETRIES[0];
+    let full = block(1, k as usize * t as usize);
+    let mut encoder = planned_encoder(k, t);
+    let stride = 8 + t as usize;
+    let mut out = vec![0u8; r as usize * stride];
+    for short in 1..=k {
+        encoder
+            .encode_block(&full[..short as usize * t as usize], short)
+            .unwrap();
+    }
+    let sizes: Vec<u32> = (1..=k).rev().flat_map(|short| [k, short]).collect();
+    COUNTING.with(|c| c.set(true));
+    ALLOCS.with(|n| n.set(0));
+    for &size in &sizes {
+        encoder
+            .encode_block(&full[..size as usize * t as usize - 3], size)
+            .unwrap();
+        encoder
+            .repair_range_into(size, r, &mut out[8..], stride)
+            .unwrap();
+    }
+    COUNTING.with(|c| c.set(false));
+    assert_eq!(ALLOCS.with(|n| n.get()), 0);
+    // One memo entry per distinct K' below the full block's K' = 138:
+    // 10, 12, 18, ..., 127.
+    assert_eq!(encoder.plan_memo_len(), 27);
+}
+
+/// `reserve` on an encoder without a plan generates the plan up front, so
+/// even the first block does not allocate.
+#[test]
+fn reserved_planless_encoder_does_not_allocate_on_its_first_block() {
+    let (k, t) = (51, 1344);
+    let data = block(2, k as usize * t as usize);
+    let mut encoder = ReusableSourceBlockEncoder::new(&config(t)).unwrap();
+    encoder.reserve(k).unwrap();
+    COUNTING.with(|c| c.set(true));
+    ALLOCS.with(|n| n.set(0));
+    encoder.encode_block(&data, k).unwrap();
+    COUNTING.with(|c| c.set(false));
+    assert_eq!(ALLOCS.with(|n| n.get()), 0);
 }
 
 #[test]
