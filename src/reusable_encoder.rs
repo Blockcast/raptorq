@@ -474,7 +474,13 @@ fn load_intermediate(
     let l = num_intermediate_symbols(source_symbols) as usize;
     let s = num_ldpc_symbols(source_symbols) as usize;
     let h = num_hdpc_symbols(source_symbols) as usize;
-    if let Some(order) = intermediate.reset_zeroed(l, source.symbol_size()) {
+    // Keep the larger of the two buffers. `reserve` may have grown
+    // `spare_order` since the last block, and the mapping handed back here
+    // can be smaller; overwriting would drop the reservation. Only the
+    // capacity matters: the `Reorder` arm clears before it fills.
+    if let Some(order) = intermediate.reset_zeroed(l, source.symbol_size())
+        && order.capacity() > spare_order.capacity()
+    {
         *spare_order = order;
     }
     intermediate.copy_block_from(s + h, source.as_bytes());

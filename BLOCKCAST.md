@@ -52,9 +52,18 @@ In order, oldest first:
    from a per-encoder memo that keeps the plan it generates for each new K'
    (byte budget, 4 MiB by default, never evicts; the process-wide cache is
    not touched). Encoding and symbol generation therefore allocate nothing
-   once each K' has been seen, including the short final block of every
-   object. `benches/reusable_encode_benchmark.rs` times encode + repair at
-   K=128, T=1344.
+   once each K' has been seen and its plan is kept, including the short
+   final block of every object, as long as the memo's budget holds those
+   plans. The default 4 MiB (`DEFAULT_PLAN_MEMO_BYTES`) holds plans for every
+   K' up to 217 together, which covers every short block of a stream of
+   blocks of up to 218 symbols; a stream of 128-symbol blocks needs 27 plans,
+   about 1.7 MB. Past the budget, a K' whose plan was not kept is solved again
+   on every block, which allocates; `reserve` returns `false` for it.
+   Decoding allocates nothing only when no symbol is lost: a decode that has
+   to solve still runs the allocating RFC 6330 solver
+   (`decode_with_loss_does_not_allocate` is `#[ignore]`d).
+   `benches/reusable_encode_benchmark.rs` times encode + repair at K=128,
+   T=1344.
 
 The old vendored copy also had some dead-code removals in `arraymap.rs`,
 `matrix.rs`, `sparse_matrix.rs` and `sparse_vec.rs`: `size_in_bytes` was gated

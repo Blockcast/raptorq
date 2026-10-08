@@ -189,6 +189,24 @@ fn every_short_block_size_does_not_allocate_once_seen() {
     assert_eq!(encoder.plan_memo_len(), 27);
 }
 
+/// `reserve` mid-life, after a smaller block, must survive the next
+/// `encode_block`: the reorder buffer it grew must not be swapped back for
+/// the smaller block's mapping.
+#[test]
+fn reserve_after_a_smaller_block_holds_for_the_next_block() {
+    let (k, t) = (128, 1344);
+    let small = block(3, 10 * t as usize);
+    let data = block(4, k as usize * t as usize);
+    let mut encoder = planned_encoder(k, t);
+    encoder.encode_block(&small, 10).unwrap();
+    assert!(encoder.reserve(k).unwrap());
+    COUNTING.with(|c| c.set(true));
+    ALLOCS.with(|n| n.set(0));
+    encoder.encode_block(&data, k).unwrap();
+    COUNTING.with(|c| c.set(false));
+    assert_eq!(ALLOCS.with(|n| n.get()), 0);
+}
+
 /// `reserve` on an encoder without a plan generates the plan up front, so
 /// even the first block does not allocate.
 #[test]
