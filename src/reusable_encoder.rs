@@ -51,6 +51,19 @@ use crate::systematic_constants::{
 /// it sees has a plan, encoding a block and generating symbols do not
 /// allocate.
 ///
+/// The budget is shared by every plan the encoder generates. The default
+/// holds plans for all K' up to 217 together, so a stream whose block sizes
+/// span more than that fills it. A burst of small blocks can also fill it
+/// early, because it never evicts. Once it is full, a block whose K' has no
+/// plan is solved again on every block, which allocates: attach a plan for
+/// the sizes that matter. [`reserve`](Self::reserve) returns `false` when the
+/// plan for a block size will not be kept.
+///
+/// Two encoders are equal (`==`) when they have the same layout and the same
+/// loaded block, or both have no block loaded. The attached plan, the plan
+/// memo and spare storage only affect speed and allocation, not the symbols,
+/// so they are not compared.
+///
 /// ```
 /// use raptorq::{ObjectTransmissionInformation, ReusableSourceBlockEncoder};
 ///
@@ -61,7 +74,7 @@ use crate::systematic_constants::{
 /// let mut repair = [0u8; 2 * 8];
 /// encoder.repair_range_into(3, 2, &mut repair, 8).unwrap(); // ESIs 3 and 4
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct ReusableSourceBlockEncoder {
     layout: SubBlockLayout,
     /// K of the loaded block; 0 when no block is loaded.
@@ -83,6 +96,18 @@ pub struct ReusableSourceBlockEncoder {
     /// The byte budget of `memo`.
     memo_limit: usize,
 }
+
+impl PartialEq for ReusableSourceBlockEncoder {
+    fn eq(&self, other: &Self) -> bool {
+        // The intermediate symbols are a function of the source symbols and
+        // K, so the source block decides every symbol this encoder writes.
+        self.layout == other.layout
+            && self.source_symbols == other.source_symbols
+            && (self.source_symbols == 0 || self.source == other.source)
+    }
+}
+
+impl Eq for ReusableSourceBlockEncoder {}
 
 impl ReusableSourceBlockEncoder {
     /// The default byte budget of the plan memo, 4 MiB: enough for a plan
@@ -194,10 +219,16 @@ impl ReusableSourceBlockEncoder {
     /// storage and, if no plan covers its K', generate one into the memo
     /// (when it fits the memo's budget).
     ///
+    /// Returns whether a plan for the block's K' is now available, attached
+    /// or in the memo. `false` means the generated plan did not fit the
+    /// memo's budget and was dropped. Every block of that size is then
+    /// re-solved, which allocates, unless a plan is attached (see the type
+    /// documentation).
+    ///
     /// # Errors
     /// [`BlockError::InvalidSourceSymbols`] if `source_symbols` is zero or
     /// above `MAX_SOURCE_SYMBOLS_PER_BLOCK`.
-    pub fn reserve(&mut self, source_symbols: u32) -> Result<(), BlockError> {
+    pub fn reserve(&mut self, source_symbols: u32) -> Result<bool, BlockError> {
         check_source_symbols(source_symbols)?;
         let l = num_intermediate_symbols(source_symbols) as usize;
         self.source.reserve_symbols(source_symbols as usize);
@@ -206,11 +237,11 @@ impl ReusableSourceBlockEncoder {
             self.spare_order.reserve(l - self.spare_order.len());
         }
         let extended = extended_source_block_symbols(source_symbols);
-        if !self.has_plan_for(extended) {
-            let plan = Self::generate_plan(source_symbols);
-            self.remember(extended, plan);
+        if self.has_plan_for(extended) {
+            return Ok(true);
         }
-        Ok(())
+        let plan = Self::generate_plan(source_symbols);
+        Ok(self.remember(extended, plan))
     }
 
     /// Source symbol `index` of the loaded block, borrowed from the

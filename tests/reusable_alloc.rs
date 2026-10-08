@@ -67,6 +67,17 @@ fn steady_state_allocs(mut op: impl FnMut(usize)) -> u64 {
     ALLOCS.with(|n| n.get())
 }
 
+/// Positive control. Every other assertion here is `== 0`, so without this
+/// they would all pass if the counting allocator were not installed or never
+/// armed. An operation that allocates on every run must be counted.
+#[test]
+fn counting_allocator_counts_a_known_allocation() {
+    let n = steady_state_allocs(|i| {
+        std::hint::black_box(vec![0u8; 64 + i]);
+    });
+    assert!(n >= 10, "counted {n} allocations in 10 allocating runs");
+}
+
 /// Production geometry (K=128, T=1344) and the small blocks.
 const GEOMETRIES: [(u32, u16, u32); 3] = [(128, 1344, 26), (12, 1344, 3), (16, 1344, 4)];
 
@@ -108,7 +119,7 @@ fn reserved_encoder_does_not_allocate_on_its_first_block() {
     let (k, t) = (128, 1344);
     let data = block(1, k as usize * t as usize);
     let mut encoder = planned_encoder(k, t);
-    encoder.reserve(k).unwrap();
+    assert!(encoder.reserve(k).unwrap());
     // The plan's reorder mapping is the only buffer reserve() cannot size
     // exactly; it is at most L entries, which reserve() covers.
     COUNTING.with(|c| c.set(true));
@@ -185,7 +196,7 @@ fn reserved_planless_encoder_does_not_allocate_on_its_first_block() {
     let (k, t) = (51, 1344);
     let data = block(2, k as usize * t as usize);
     let mut encoder = ReusableSourceBlockEncoder::new(&config(t)).unwrap();
-    encoder.reserve(k).unwrap();
+    assert!(encoder.reserve(k).unwrap());
     COUNTING.with(|c| c.set(true));
     ALLOCS.with(|n| n.set(0));
     encoder.encode_block(&data, k).unwrap();

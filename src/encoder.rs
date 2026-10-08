@@ -15,6 +15,8 @@ use crate::matrix::DenseBinaryMatrix;
 use crate::octets::add_assign;
 use crate::operation_vector::{SymbolOps, perform_op};
 use crate::pi_solver::fused_inverse_mul_symbols;
+#[cfg(feature = "std")]
+use crate::reusable::{BlockError, check_source_symbols};
 use crate::sparse_matrix::SparseBinaryMatrix;
 use crate::symbol_slab::SymbolSlab;
 use crate::systematic_constants::extended_source_block_symbols;
@@ -188,9 +190,14 @@ impl SourceBlockEncodingPlan {
     /// short final block of each object, should fetch only the plans they
     /// reuse (for example, the full-block size) and encode the rest without
     /// a plan.
+    ///
+    /// # Errors
+    /// [`BlockError::InvalidSourceSymbols`] if `symbol_count` is zero or
+    /// above `MAX_SOURCE_SYMBOLS_PER_BLOCK` (56403).
     #[cfg(feature = "std")]
-    pub fn cached(symbol_count: u16) -> Arc<SourceBlockEncodingPlan> {
-        get_or_generate_source_block_encoding_plan(symbol_count)
+    pub fn cached(symbol_count: u16) -> Result<Arc<SourceBlockEncodingPlan>, BlockError> {
+        check_source_symbols(u32::from(symbol_count))?;
+        Ok(get_or_generate_source_block_encoding_plan(symbol_count))
     }
 
     /// The number of source symbols this plan encodes.

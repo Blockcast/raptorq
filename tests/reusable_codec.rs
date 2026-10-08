@@ -10,6 +10,13 @@ use raptorq::{
     SourceBlockEncodingPlan,
 };
 
+/// `==` on the reusable codecs compares only block-observable state. The
+/// "on error nothing changed" assertions need every field, so compare the
+/// full `Debug` rendering instead.
+fn assert_same_state<T: std::fmt::Debug>(actual: &T, before: &T) {
+    assert_eq!(format!("{actual:?}"), format!("{before:?}"));
+}
+
 /// xorshift64*: deterministic, seedable, no dependency.
 struct Rng(u64);
 
@@ -340,9 +347,9 @@ fn plan_memo_keeps_one_plan_per_extended_size_within_its_budget() {
 
     // reserve() fills the memo up front.
     encoder.set_plan_memo_limit(ReusableSourceBlockEncoder::DEFAULT_PLAN_MEMO_BYTES);
-    encoder.reserve(20).unwrap();
+    assert!(encoder.reserve(20).unwrap());
     assert_eq!(encoder.plan_memo_len(), 1);
-    encoder.reserve(19).unwrap();
+    assert!(encoder.reserve(19).unwrap());
     assert_eq!(encoder.plan_memo_len(), 1, "19 and 20 share K' = 20");
     check(&mut encoder, &mut rng, 19);
     assert_eq!(encoder.plan_memo_len(), 1);
@@ -730,7 +737,7 @@ fn encoder_errors_leave_state_unchanged() {
         encoder.repair_into(&[0], &mut [0u8; 16], 16),
         Err(BlockError::NoBlock)
     );
-    assert_eq!(encoder, before);
+    assert_same_state(&encoder, &before);
 
     let data = Rng::new(10).bytes(8 * 16);
     encoder.encode_block(&data, 8).unwrap();
@@ -752,7 +759,7 @@ fn encoder_errors_leave_state_unchanged() {
         Err(BlockError::DataTooLong { len: 129, max: 128 })
     );
     assert_eq!(encoder.reserve(0), Err(BlockError::InvalidSourceSymbols(0)));
-    assert_eq!(encoder, before);
+    assert_same_state(&encoder, &before);
 
     let mut out = vec![0xA5u8; 40];
     assert_eq!(
@@ -781,7 +788,7 @@ fn encoder_errors_leave_state_unchanged() {
         Err(BlockError::InvalidEsi(u32::MAX))
     );
     assert!(out.iter().all(|&b| b == 0xA5), "nothing written on error");
-    assert_eq!(encoder, before);
+    assert_same_state(&encoder, &before);
     // The block is still the one loaded before the errors.
     assert_eq!(
         new_range(&encoder, 0, 12),
@@ -800,7 +807,7 @@ fn decoder_errors_leave_state_unchanged() {
         Err(BlockError::NoBlock)
     );
     assert_eq!(decoder.reset(0), Err(BlockError::InvalidSourceSymbols(0)));
-    assert_eq!(decoder, before);
+    assert_same_state(&decoder, &before);
 
     let k = 6;
     let data = Rng::new(11).bytes(k as usize * 16);
@@ -834,7 +841,7 @@ fn decoder_errors_leave_state_unchanged() {
         decoder.copy_block_into(0, &mut out),
         Err(BlockError::NotDecoded)
     );
-    assert_eq!(decoder, before);
+    assert_same_state(&decoder, &before);
 
     for esi in [7, 8] {
         decoder.add_symbol(esi, &symbols[esi as usize]).unwrap();
@@ -864,9 +871,97 @@ fn decoder_errors_leave_state_unchanged() {
 #[cfg(feature = "std")]
 #[test]
 fn cached_plan_is_shared_and_equal_to_a_generated_one() {
-    let a = SourceBlockEncodingPlan::cached(37);
-    let b = SourceBlockEncodingPlan::cached(37);
+    let a = SourceBlockEncodingPlan::cached(37).unwrap();
+    let b = SourceBlockEncodingPlan::cached(37).unwrap();
     assert!(Arc::ptr_eq(&a, &b));
     assert_eq!(*a, SourceBlockEncodingPlan::generate(37));
     assert_eq!(a.source_symbol_count(), 37);
+}
+
+#[cfg(feature = "std")]
+#[test]
+fn cached_plan_rejects_an_invalid_symbol_count() {
+    for k in [0u16, 56404, 65535] {
+        assert_eq!(
+            SourceBlockEncodingPlan::cached(k),
+            Err(BlockError::InvalidSourceSymbols(u32::from(k))),
+            "k={k}"
+        );
+    }
+}
+
+/// `reserve` reports whether the plan for the block's K' is available
+/// afterwards, instead of succeeding when the memo refused it.
+#[test]
+fn reserve_reports_a_plan_the_memo_does_not_keep() {
+    let cfg = config(16, 1, 8);
+    let mut encoder = ReusableSourceBlockEncoder::new(&cfg).unwrap();
+    encoder.set_plan_memo_limit(0);
+    assert_eq!(encoder.reserve(20), Ok(false));
+    assert_eq!(encoder.plan_memo_len(), 0);
+
+    encoder.set_plan_memo_limit(ReusableSourceBlockEncoder::DEFAULT_PLAN_MEMO_BYTES);
+    assert_eq!(encoder.reserve(20), Ok(true));
+    assert_eq!(encoder.plan_memo_len(), 1);
+    assert_eq!(encoder.reserve(19), Ok(true), "19 shares K' = 20");
+
+    // An attached plan covers its K' with no memo at all.
+    let plan = Arc::new(SourceBlockEncodingPlan::generate(30));
+    let mut planned = ReusableSourceBlockEncoder::with_plan(&cfg, plan).unwrap();
+    planned.set_plan_memo_limit(0);
+    assert_eq!(planned.reserve(30), Ok(true));
+    assert_eq!(planned.plan_memo_len(), 0);
+}
+
+/// Equality is about the loaded block, not the plan memo or spare storage.
+#[test]
+fn encoders_with_the_same_block_are_equal_whatever_their_plan_memo() {
+    let cfg = config(16, 1, 8);
+    let data = Rng::new(13).bytes(8 * 16);
+    let mut a = ReusableSourceBlockEncoder::new(&cfg).unwrap();
+    let mut b = ReusableSourceBlockEncoder::new(&cfg).unwrap();
+    // `a` also memoizes the plan for K' = 20.
+    a.encode_block(&Rng::new(14).bytes(20 * 16), 20).unwrap();
+    a.encode_block(&data, 8).unwrap();
+    b.encode_block(&data, 8).unwrap();
+    assert_ne!(a.plan_memo_len(), b.plan_memo_len());
+    assert_eq!(a, b);
+
+    b.encode_block(&Rng::new(15).bytes(8 * 16), 8).unwrap();
+    assert_ne!(a, b);
+
+    a.clear();
+    b.clear();
+    assert_eq!(a, b, "no block loaded");
+    assert_eq!(a, ReusableSourceBlockEncoder::new(&cfg).unwrap());
+}
+
+/// Equality is about the received symbols, not the lifetime solve count.
+#[test]
+fn decoders_with_the_same_symbols_are_equal_whatever_their_solve_count() {
+    let cfg = config(16, 1, 8);
+    let k = 6;
+    let data = Rng::new(16).bytes(k as usize * 16);
+    let symbols = block_symbols(&cfg, &data, k, 4);
+    let mut a = ReusableSourceBlockDecoder::new(&cfg).unwrap();
+    let mut b = ReusableSourceBlockDecoder::new(&cfg).unwrap();
+    // `a` solves one block first.
+    a.reset(k).unwrap();
+    for esi in 1..8 {
+        a.add_symbol(esi, &symbols[esi as usize]).unwrap();
+    }
+    assert!(a.try_decode().unwrap());
+    assert_eq!(a.solve_count(), 1);
+
+    for decoder in [&mut a, &mut b] {
+        decoder.reset(k).unwrap();
+        for esi in [0, 2, 7] {
+            decoder.add_symbol(esi, &symbols[esi as usize]).unwrap();
+        }
+    }
+    assert_eq!(b.solve_count(), 0);
+    assert_eq!(a, b);
+
+    b.add_symbol(8, &symbols[8]).unwrap();
+    assert_ne!(a, b);
 }

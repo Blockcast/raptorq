@@ -58,7 +58,7 @@ use crate::systematic_constants::{
 /// decoder.copy_block_into(0, &mut block).unwrap();
 /// assert_eq!(block[0], 1);
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct ReusableSourceBlockDecoder {
     layout: SubBlockLayout,
     /// K of the current block; 0 before the first reset.
@@ -77,6 +77,26 @@ pub struct ReusableSourceBlockDecoder {
     unattempted: bool,
     solves: u64,
 }
+
+/// Two decoders are equal when they hold the same block: the same layout, K,
+/// received source and repair symbols, and decode state. The lifetime solve
+/// count and the "symbol added since the last attempt" flag are not
+/// compared. The flag only skips re-running a solve that already failed with
+/// the same symbols, so it cannot change any result.
+impl PartialEq for ReusableSourceBlockDecoder {
+    fn eq(&self, other: &Self) -> bool {
+        self.layout == other.layout
+            && self.source_symbols == other.source_symbols
+            && self.source == other.source
+            && self.received_source == other.received_source
+            && self.received_source_count == other.received_source_count
+            && self.repair == other.repair
+            && self.repair_esis == other.repair_esis
+            && self.decoded == other.decoded
+    }
+}
+
+impl Eq for ReusableSourceBlockDecoder {}
 
 impl ReusableSourceBlockDecoder {
     /// Create a decoder with no block. Call [`reset`](Self::reset) before
