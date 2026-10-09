@@ -34,6 +34,36 @@ In order, oldest first:
    `ec2334b`). The fec-raptorq C bindings use it to reject an oversized block
    before the encoder asserts.
 4. This file.
+5. **Reusable block codec** (`src/reusable*.rs`): `ReusableSourceBlockEncoder`,
+   `ReusableSourceBlockDecoder` and `BlockError`. This API is additive: the
+   existing types are untouched. An encoder is refilled block after block,
+   and a decoder is reset block after block, keeping their storage. Symbols
+   go into caller buffers (`repair_into`, `repair_range_into`,
+   `copy_block_into`). The decoder deduplicates by ESI and does not solve
+   again until a new symbol arrives. It is the crate side of the fec-raptorq
+   zero-allocation batched FFI. Tests: `tests/reusable_codec.rs`
+   (differential and reuse) and `tests/reusable_alloc.rs` (steady-state
+   allocation counts). Supporting changes: `SourceBlockEncodingPlan::cached(K)`
+   (upstream's process-wide plan cache) and `source_symbol_count()`, plus
+   crate-private `SymbolSlab` helpers that reshape a slab in place.
+   The encoder encodes every block by replaying a plan for the block's
+   extended size K' into its own storage (a plan depends only on K', so one
+   plan serves every K with that K'). Plans come from the attached plan or
+   from a per-encoder memo that keeps the plan it generates for each new K'
+   (byte budget, 4 MiB by default, never evicts; the process-wide cache is
+   not touched). Encoding and symbol generation therefore allocate nothing
+   once each K' has been seen and its plan is kept, including the short
+   final block of every object, as long as the memo's budget holds those
+   plans. The default 4 MiB (`DEFAULT_PLAN_MEMO_BYTES`) holds plans for every
+   K' up to 217 together, which covers every short block of a stream of
+   blocks of up to 218 symbols; a stream of 128-symbol blocks needs 27 plans,
+   about 1.7 MB. Past the budget, a K' whose plan was not kept is solved again
+   on every block, which allocates; `reserve` returns `false` for it.
+   Decoding allocates nothing only when no symbol is lost: a decode that has
+   to solve still runs the allocating RFC 6330 solver
+   (`decode_with_loss_does_not_allocate` is `#[ignore]`d).
+   `benches/reusable_encode_benchmark.rs` times encode + repair at K=128,
+   T=1344.
 
 The old vendored copy also had some dead-code removals in `arraymap.rs`,
 `matrix.rs`, `sparse_matrix.rs` and `sparse_vec.rs`: `size_in_bytes` was gated

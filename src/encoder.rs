@@ -15,6 +15,8 @@ use crate::matrix::DenseBinaryMatrix;
 use crate::octets::add_assign;
 use crate::operation_vector::{SymbolOps, perform_op};
 use crate::pi_solver::fused_inverse_mul_symbols;
+#[cfg(feature = "std")]
+use crate::reusable::{BlockError, check_source_symbols};
 use crate::sparse_matrix::SparseBinaryMatrix;
 use crate::symbol_slab::SymbolSlab;
 use crate::systematic_constants::extended_source_block_symbols;
@@ -179,8 +181,60 @@ pub struct SourceBlockEncodingPlan {
 }
 
 impl SourceBlockEncodingPlan {
+    /// The process-wide cached plan for `symbol_count` source symbols,
+    /// generating and inserting it on a miss.
+    ///
+    /// This is the cache [`SourceBlockEncoder::new`] uses: it is shared by
+    /// every encoder in the process and holds at most 64 plans (first in,
+    /// first out). Callers that see many distinct block sizes, such as the
+    /// short final block of each object, should fetch only the plans they
+    /// reuse (for example, the full-block size) and encode the rest without
+    /// a plan.
+    ///
+    /// # Errors
+    /// [`BlockError::InvalidSourceSymbols`] if `symbol_count` is zero or
+    /// above `MAX_SOURCE_SYMBOLS_PER_BLOCK` (56403).
+    #[cfg(feature = "std")]
+    pub fn cached(symbol_count: u16) -> Result<Arc<SourceBlockEncodingPlan>, BlockError> {
+        check_source_symbols(u32::from(symbol_count))?;
+        Ok(get_or_generate_source_block_encoding_plan(symbol_count))
+    }
+
+    /// The number of source symbols this plan encodes.
+    pub fn source_symbol_count(&self) -> u16 {
+        self.source_symbol_count
+    }
+
+    pub(crate) fn operations(&self) -> &[SymbolOps] {
+        &self.operations
+    }
+
+    /// Release the spare capacity of the operation list. The solver sizes it
+    /// for the worst case (70 operations per intermediate symbol), roughly
+    /// three times what a plan uses.
+    pub(crate) fn shrink_to_fit(&mut self) {
+        self.operations.shrink_to_fit();
+    }
+
+    /// The heap bytes this plan holds: its operation list and the reorder
+    /// mappings in it.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        let mappings: usize = self
+            .operations
+            .iter()
+            .map(|op| match op {
+                SymbolOps::Reorder { order } => order.capacity() * core::mem::size_of::<usize>(),
+                _ => 0,
+            })
+            .sum();
+        self.operations.capacity() * core::mem::size_of::<SymbolOps>() + mappings
+    }
+
     // Generates an encoding plan that is valid for any combination of data length and symbol size
-    // where ceil(data_length / symbol_size) = symbol_count
+    // where ceil(data_length / symbol_size) = symbol_count.
+    // The operations depend only on the extended source block size K' of symbol_count (section
+    // 5.3.1): the constraint matrix and the L intermediate symbols are those of K', so a plan
+    // also encodes every other symbol count with the same K'.
     pub fn generate(symbol_count: u16) -> SourceBlockEncodingPlan {
         // TODO: refactor pi_solver, so that we don't need this dummy data to generate a plan
         let symbols = SymbolSlab::with_zeros(symbol_count as usize, 1);
@@ -445,7 +499,7 @@ fn gen_intermediate_symbols_with_plan(
 // Allocation-free Enc[] function, as defined in section 5.3.5.3.
 // Writes the encoded symbol directly into `dest`.
 #[allow(clippy::many_single_char_names)]
-fn enc_into(
+pub(crate) fn enc_into(
     dest: &mut [u8],
     source_block_symbols: u32,
     intermediate_symbols: &SymbolSlab,
