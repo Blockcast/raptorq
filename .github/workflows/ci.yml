@@ -64,6 +64,11 @@ jobs:
       - name: Run tests
         run: just test
 
+      # FULL (`!cfg!(debug_assertions)`) runs only optimized: the production
+      # sizes, the sparse-solver K and the K=256 in-place encoder cases.
+      - name: Run reusable codec tests (release)
+        run: cargo test --release --test reusable_codec --test reusable_alloc
+
       - name: Compile benchmarks
         run: cargo bench --features benchmarking --no-run
 

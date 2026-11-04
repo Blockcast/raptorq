@@ -11,9 +11,11 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::Arc;
 
+use std::mem::MaybeUninit;
+
 use raptorq::{
-    ObjectTransmissionInformation, ReusableSourceBlockDecoder, ReusableSourceBlockEncoder,
-    SourceBlockEncodingPlan,
+    EncodingPlanMemo, InPlaceBlockEncoder, ObjectTransmissionInformation,
+    ReusableSourceBlockDecoder, ReusableSourceBlockEncoder, SourceBlockEncodingPlan,
 };
 
 struct Counting;
@@ -407,6 +409,44 @@ fn decode_with_loss_does_not_allocate() {
             }
             assert!(decoder.try_decode().unwrap());
             decoder.copy_block_into(0, &mut out).unwrap();
+        });
+        assert_eq!(n, 0, "k={k}");
+    }
+}
+
+/// The in-place encoder: once each K' has been closed once, writing source
+/// rows, closing at any k (full or short) and generating symbols into an
+/// uninitialized caller buffer do not allocate.
+#[test]
+fn in_place_encoder_does_not_allocate_once_each_size_is_seen() {
+    for (k, t, r) in GEOMETRIES {
+        let full = SourceBlockEncodingPlan::cached(k as u16).unwrap();
+        let mut encoder = InPlaceBlockEncoder::new(t, k, full).unwrap();
+        let mut memo = EncodingPlanMemo::new(usize::MAX);
+        let mut out: Vec<MaybeUninit<u8>> = Vec::with_capacity(r as usize * (t as usize + 25));
+        // SAFETY: `symbols_into` takes uninitialized memory.
+        unsafe { out.set_len(out.capacity()) };
+        let sizes: Vec<u32> = (1..=k).rev().collect();
+        let data = block(k as usize, t as usize);
+        let mut run = |i: usize| {
+            let n = sizes[i % sizes.len()];
+            encoder.reopen();
+            for esi in 0..n {
+                encoder.source_row_mut(esi).unwrap().copy_from_slice(&data);
+            }
+            encoder.close(n, &mut memo).unwrap();
+            encoder
+                .symbols_into(n, r, &mut out[25..], t as usize + 25)
+                .unwrap();
+        };
+        // Warm up every size, then measure every size again.
+        for i in 0..sizes.len() {
+            run(i);
+        }
+        let n = steady_state_allocs(|i| {
+            for j in 0..sizes.len() {
+                run(i * sizes.len() + j);
+            }
         });
         assert_eq!(n, 0, "k={k}");
     }

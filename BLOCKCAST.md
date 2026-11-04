@@ -64,6 +64,24 @@ In order, oldest first:
    (`decode_with_loss_does_not_allocate` is `#[ignore]`d).
    `benches/reusable_encode_benchmark.rs` times encode + repair at K=128,
    T=1344.
+6. **In-place block encoder** (`src/inplace_encoder.rs`):
+   `InPlaceBlockEncoder` and `EncodingPlanMemo`. Additive: no existing type
+   or signature changes. The encoder holds one L(K) * T slab, the D vector
+   of RFC 6330 section 5.3.3.4, and the caller writes source symbol `i`
+   straight into its row (`S + H + i`, with S and H of K) through
+   `source_row_mut`. `close(k)` zeroes only the L(k) - k non-source rows of
+   the window that starts at `(S + H)(K) - (S + H)(k)` and replays the
+   row operations of the plan for K'(k) over that window: the full-block
+   plan given at construction, or one from an `EncodingPlanMemo` shared by
+   the caller's encoders (generated on the first close of each K', kept
+   within the memo's byte budget). The plan's final reorder is borrowed to
+   address C, not copied. `symbols_into` writes Enc[] output into an
+   uninitialized caller buffer at any stride; its first term is copied
+   through a raw pointer (`enc_into_uninit`, which `enc_into` now calls).
+   So each source symbol is written once, each output symbol once, and once
+   each K' has a plan nothing allocates. Tests: the in-place arms of
+   `tests/reusable_codec.rs` (against `SourceBlockEncoder`, full and short
+   closes) and `tests/reusable_alloc.rs`. CI runs both in release too.
 
 The old vendored copy also had some dead-code removals in `arraymap.rs`,
 `matrix.rs`, `sparse_matrix.rs` and `sparse_vec.rs`: `size_in_bytes` was gated

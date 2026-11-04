@@ -4,10 +4,12 @@
 
 use std::sync::Arc;
 
+use std::mem::MaybeUninit;
+
 use raptorq::{
-    BlockError, EncodingPacket, ObjectTransmissionInformation, PayloadId,
-    ReusableSourceBlockDecoder, ReusableSourceBlockEncoder, SourceBlockDecoder, SourceBlockEncoder,
-    SourceBlockEncodingPlan,
+    BlockError, EncodingPacket, EncodingPlanMemo, InPlaceBlockEncoder,
+    ObjectTransmissionInformation, PayloadId, ReusableSourceBlockDecoder,
+    ReusableSourceBlockEncoder, SourceBlockDecoder, SourceBlockEncoder, SourceBlockEncodingPlan,
 };
 
 /// `==` on the reusable codecs compares only block-observable state. The
@@ -87,6 +89,41 @@ fn new_range(encoder: &ReusableSourceBlockEncoder, first: u32, count: u32) -> Ve
     out.chunks(t).map(|c| c.to_vec()).collect()
 }
 
+/// `out` as the uninitialized-memory view `symbols_into` takes.
+fn uninit(out: &mut [u8]) -> &mut [MaybeUninit<u8>] {
+    // SAFETY: same layout; `symbols_into` writes only initialized bytes.
+    unsafe { &mut *(out as *mut [u8] as *mut [MaybeUninit<u8>]) }
+}
+
+/// Write `data`, zero-padded to `k * T`, into the source rows of an open
+/// in-place encoder and close it at `k`.
+fn in_place_load(
+    encoder: &mut InPlaceBlockEncoder,
+    memo: &mut EncodingPlanMemo,
+    data: &[u8],
+    k: u32,
+) {
+    let t = encoder.symbol_size() as usize;
+    encoder.reopen();
+    for i in 0..k {
+        let row = encoder.source_row_mut(i).unwrap();
+        let start = (i as usize * t).min(data.len());
+        let end = (start + t).min(data.len());
+        row[..end - start].copy_from_slice(&data[start..end]);
+        row[end - start..].fill(0);
+    }
+    encoder.close(k, memo).unwrap();
+}
+
+fn in_place_range(encoder: &InPlaceBlockEncoder, first: u32, count: u32) -> Vec<Vec<u8>> {
+    let t = encoder.symbol_size() as usize;
+    let mut out = vec![0u8; count as usize * t];
+    encoder
+        .symbols_into(first, count, uninit(&mut out), t)
+        .unwrap();
+    out.chunks(t).map(|c| c.to_vec()).collect()
+}
+
 /// Encode `data` as a K-symbol block with every arm and compare all ESIs
 /// `0..k + repair` with `SourceBlockEncoder`.
 fn check_encode(cfg: &ObjectTransmissionInformation, data: &[u8], k: u32, repair: u32) {
@@ -127,6 +164,23 @@ fn check_encode(cfg: &ObjectTransmissionInformation, data: &[u8], k: u32, repair
         reference,
         "other plan k={k}"
     );
+
+    // In-place arms (one sub-block only): a K = k encoder with the block's
+    // own plan, and a larger encoder that closes k as a short block, both
+    // over the same memo.
+    if cfg.sub_blocks() == 1 {
+        let mut memo = EncodingPlanMemo::new(usize::MAX);
+        for max in [k, (k + 37).min(raptorq::MAX_SOURCE_SYMBOLS_PER_BLOCK)] {
+            let full = Arc::new(SourceBlockEncodingPlan::generate(max as u16));
+            let mut in_place = InPlaceBlockEncoder::new(t as u16, max, full).unwrap();
+            in_place_load(&mut in_place, &mut memo, data, k);
+            assert_eq!(
+                in_place_range(&in_place, 0, k + repair),
+                reference,
+                "in place K={max} k={k}"
+            );
+        }
+    }
 
     // repair_into with an arbitrary ESI list and a header-reserving stride.
     let mut esis: Vec<u32> = (0..k + repair).collect();
@@ -964,4 +1018,136 @@ fn decoders_with_the_same_symbols_are_equal_whatever_their_solve_count() {
 
     b.add_symbol(8, &symbols[8]).unwrap();
     assert_ne!(a, b);
+}
+
+/// An in-place encoder reused block after block, with full and short
+/// closes, matches `SourceBlockEncoder`, keeps one memo plan per short K',
+/// and leaves the bytes around each strided symbol untouched.
+#[test]
+fn in_place_encoder_reused_across_full_and_short_blocks() {
+    let mut rng = Rng::new(21);
+    for (max, t) in [(32u32, 1312u16), (64, 1312), (256, 64)] {
+        if !FULL && max == 256 {
+            continue;
+        }
+        let cfg = config(t, 1, 8);
+        let mut memo = EncodingPlanMemo::new(usize::MAX);
+        let full = SourceBlockEncodingPlan::cached(max as u16).unwrap();
+        let mut encoder = InPlaceBlockEncoder::new(t, max, full).unwrap();
+        let sizes = [max, 1, max - 1, 2, max, max / 2 + 1, 10, max, 1];
+        for (n, &k) in sizes.iter().enumerate() {
+            let data = rng.bytes(k as usize * t as usize - n);
+            in_place_load(&mut encoder, &mut memo, &data, k);
+            assert_eq!(encoder.closed_source_symbols(), Some(k));
+            let reference = reference_symbols(&cfg, &data, k, 20, None);
+            assert_eq!(
+                in_place_range(&encoder, 0, k + 20),
+                reference,
+                "K={max} k={k}"
+            );
+            let stride = t as usize + 25;
+            let mut out = vec![0x5Au8; 20 * stride];
+            encoder
+                .symbols_into(k, 20, uninit(&mut out[25..]), stride)
+                .unwrap();
+            for i in 0..20 {
+                let at = i * stride;
+                assert!(out[at..at + 25].iter().all(|&b| b == 0x5A));
+                assert_eq!(&out[at + 25..at + stride], &reference[k as usize + i][..]);
+            }
+        }
+        let extended = |k| raptorq::extended_source_block_symbols(k);
+        let mut short: Vec<u32> = sizes
+            .iter()
+            .map(|&k| extended(k))
+            .filter(|&e| e != extended(max))
+            .collect();
+        short.sort();
+        short.dedup();
+        assert_eq!(memo.len(), short.len(), "K={max}");
+    }
+}
+
+#[test]
+fn in_place_encoder_errors() {
+    let t = 16u16;
+    let full = Arc::new(SourceBlockEncodingPlan::generate(20));
+    assert_eq!(
+        InPlaceBlockEncoder::new(t, 30, Arc::clone(&full)).err(),
+        Some(BlockError::InvalidConfig)
+    );
+    assert_eq!(
+        InPlaceBlockEncoder::new(0, 20, Arc::clone(&full)).err(),
+        Some(BlockError::InvalidConfig)
+    );
+    assert_eq!(
+        InPlaceBlockEncoder::new(t, 0, Arc::clone(&full)).err(),
+        Some(BlockError::InvalidSourceSymbols(0))
+    );
+    let mut memo = EncodingPlanMemo::new(0);
+    let mut encoder = InPlaceBlockEncoder::new(t, 20, full).unwrap();
+    let mut out = vec![0u8; 64];
+    assert_eq!(
+        encoder.symbols_into(0, 1, uninit(&mut out), 16),
+        Err(BlockError::NoBlock)
+    );
+    assert!(encoder.source_row_mut(20).is_none());
+    assert_eq!(
+        encoder.close(0, &mut memo),
+        Err(BlockError::InvalidSourceSymbols(0))
+    );
+    assert_eq!(
+        encoder.close(21, &mut memo),
+        Err(BlockError::InvalidSourceSymbols(21))
+    );
+    in_place_load(&mut encoder, &mut memo, &[1, 2, 3], 3);
+    // A zero-budget memo keeps nothing, but the block still encodes.
+    assert!(memo.is_empty());
+    assert!(encoder.source_row_mut(0).is_none());
+    assert!(encoder.source_row(0).is_none());
+    assert_eq!(encoder.close(3, &mut memo), Ok(()));
+    assert_eq!(
+        encoder.close(4, &mut memo),
+        Err(BlockError::InvalidSourceSymbols(4))
+    );
+    let before = out.clone();
+    assert_eq!(
+        encoder.symbols_into(0, 2, uninit(&mut out), 15),
+        Err(BlockError::InvalidStride {
+            stride: 15,
+            symbol_size: 16
+        })
+    );
+    assert_eq!(
+        encoder.symbols_into(0, 5, uninit(&mut out), 16),
+        Err(BlockError::BufferTooSmall {
+            len: 64,
+            needed: 80
+        })
+    );
+    assert_eq!(
+        encoder.symbols_into((1 << 24) - 1, 2, uninit(&mut out), 16),
+        Err(BlockError::InvalidEsi(1 << 24))
+    );
+    assert_eq!(out, before);
+    encoder.symbols_into(0, 0, &mut [], 16).unwrap();
+    encoder
+        .symbols_into((1 << 24) - 1, 1, uninit(&mut out), 16)
+        .unwrap();
+}
+
+/// The plan memo's byte budget: `reserve` reports whether a plan is kept.
+#[test]
+fn plan_memo_reserve_respects_its_budget() {
+    let mut memo = EncodingPlanMemo::new(usize::MAX);
+    assert_eq!(memo.reserve(0), Err(BlockError::InvalidSourceSymbols(0)));
+    assert_eq!(memo.reserve(10), Ok(true));
+    assert_eq!(memo.reserve(10), Ok(true));
+    assert_eq!(memo.len(), 1);
+    let bytes = memo.heap_bytes();
+    let mut tight = EncodingPlanMemo::new(bytes);
+    assert_eq!(tight.reserve(10), Ok(true));
+    assert_eq!(tight.reserve(12), Ok(false));
+    assert_eq!(tight.len(), 1);
+    assert_eq!(tight.limit(), bytes);
 }
