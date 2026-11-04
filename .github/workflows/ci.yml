@@ -8,10 +8,12 @@ on:
 
 jobs:
   ci:
-    runs-on: ${{ matrix.os == 'linux' && fromJSON('{"group":"default-tools","labels":"arc-light"}') || matrix.os }}
+    runs-on:
+      group: default-tools
+      labels: arc-light
     strategy:
       matrix:
-        os: ["linux", "macos-latest"]
+        os: [linux]
 
     steps:
       - uses: actions/checkout@v2
