@@ -146,7 +146,7 @@ fn check_encode(cfg: &ObjectTransmissionInformation, data: &[u8], k: u32, repair
     );
 
     // Planned arm.
-    let mut planned = ReusableSourceBlockEncoder::with_plan(cfg, plan).unwrap();
+    let mut planned = ReusableSourceBlockEncoder::with_plan(cfg, Arc::clone(&plan)).unwrap();
     planned.encode_block(data, k).unwrap();
     assert_eq!(
         new_range(&planned, 0, k + repair),
@@ -170,8 +170,13 @@ fn check_encode(cfg: &ObjectTransmissionInformation, data: &[u8], k: u32, repair
     // over the same memo.
     if cfg.sub_blocks() == 1 {
         let mut memo = EncodingPlanMemo::new(usize::MAX);
-        for max in [k, (k + 37).min(raptorq::MAX_SOURCE_SYMBOLS_PER_BLOCK)] {
-            let full = Arc::new(SourceBlockEncodingPlan::generate(max as u16));
+        let mut arms = vec![(k, Arc::clone(&plan))];
+        // Debug builds sample the short-close arm; its full plan is slow there.
+        if FULL || k % 8 == 1 {
+            let max = (k + 37).min(raptorq::MAX_SOURCE_SYMBOLS_PER_BLOCK);
+            arms.push((max, Arc::new(SourceBlockEncodingPlan::generate(max as u16))));
+        }
+        for (max, full) in arms {
             let mut in_place = InPlaceBlockEncoder::new(t as u16, max, full).unwrap();
             in_place_load(&mut in_place, &mut memo, data, k);
             assert_eq!(
@@ -1032,7 +1037,7 @@ fn in_place_encoder_reused_across_full_and_short_blocks() {
         }
         let cfg = config(t, 1, 8);
         let mut memo = EncodingPlanMemo::new(usize::MAX);
-        let full = SourceBlockEncodingPlan::cached(max as u16).unwrap();
+        let full = Arc::new(SourceBlockEncodingPlan::generate(max as u16));
         let mut encoder = InPlaceBlockEncoder::new(t, max, full).unwrap();
         let sizes = [max, 1, max - 1, 2, max, max / 2 + 1, 10, max, 1];
         for (n, &k) in sizes.iter().enumerate() {

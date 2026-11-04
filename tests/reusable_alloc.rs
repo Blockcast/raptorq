@@ -420,13 +420,19 @@ fn decode_with_loss_does_not_allocate() {
 #[test]
 fn in_place_encoder_does_not_allocate_once_each_size_is_seen() {
     for (k, t, r) in GEOMETRIES {
-        let full = SourceBlockEncodingPlan::cached(k as u16).unwrap();
+        let full = Arc::new(SourceBlockEncodingPlan::generate(k as u16));
         let mut encoder = InPlaceBlockEncoder::new(t, k, full).unwrap();
         let mut memo = EncodingPlanMemo::new(usize::MAX);
         let mut out: Vec<MaybeUninit<u8>> = Vec::with_capacity(r as usize * (t as usize + 25));
         // SAFETY: `symbols_into` takes uninitialized memory.
         unsafe { out.set_len(out.capacity()) };
-        let sizes: Vec<u32> = (1..=k).rev().collect();
+        // Every k in release; the edges and a middle k in debug, where plan
+        // generation is slow.
+        let sizes: Vec<u32> = if cfg!(debug_assertions) {
+            vec![k, k - 1, k / 2 + 1, 1]
+        } else {
+            (1..=k).rev().collect()
+        };
         let data = block(k as usize, t as usize);
         let mut run = |i: usize| {
             let n = sizes[i % sizes.len()];
