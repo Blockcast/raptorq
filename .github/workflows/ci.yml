@@ -8,10 +8,10 @@ on:
 
 jobs:
   ci:
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os == 'linux' && fromJSON('{"group":"default-tools","labels":"arc-light"}') || matrix.os }}
     strategy:
       matrix:
-        os: ["ubuntu-latest", "macos-latest"]
+        os: ["linux", "macos-latest"]
 
     steps:
       - uses: actions/checkout@v2
@@ -37,7 +37,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Non ASCII characters
-        if: startsWith(matrix.os, 'ubuntu')
+        if: matrix.os == 'linux'
         run: |
           if grep -P -n "[^\x00-\x7F]" -r --include="*.rs" --include="*.toml" .; then
           echo "Non-ASCII characters detected"
