@@ -8,10 +8,13 @@ on:
 
 jobs:
   ci:
-    runs-on: ${{ matrix.os }}
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on:
+      group: default-tools
+      labels: arc-light
     strategy:
       matrix:
-        os: ["ubuntu-latest", "macos-latest"]
+        os: [linux]
 
     steps:
       - uses: actions/checkout@v2
@@ -37,7 +40,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Non ASCII characters
-        if: startsWith(matrix.os, 'ubuntu')
+        if: matrix.os == 'linux'
         run: |
           if grep -P -n "[^\x00-\x7F]" -r --include="*.rs" --include="*.toml" .; then
           echo "Non-ASCII characters detected"
