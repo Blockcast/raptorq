@@ -5,6 +5,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(feature = "std")]
 use std::vec::Vec;
 
+use core::mem::MaybeUninit;
+
 use crate::ObjectTransmissionInformation;
 use crate::base::EncodingPacket;
 use crate::base::PayloadId;
@@ -498,11 +500,33 @@ fn gen_intermediate_symbols_with_plan(
 
 // Allocation-free Enc[] function, as defined in section 5.3.5.3.
 // Writes the encoded symbol directly into `dest`.
-#[allow(clippy::many_single_char_names)]
 pub(crate) fn enc_into(
     dest: &mut [u8],
     source_block_symbols: u32,
     intermediate_symbols: &SymbolSlab,
+    source_tuple: (u32, u32, u32, u32, u32, u32),
+) {
+    // SAFETY: `[u8]` and `[MaybeUninit<u8>]` have the same layout, and
+    // `enc_into_uninit` writes only initialized bytes.
+    let dest = unsafe { &mut *(dest as *mut [u8] as *mut [MaybeUninit<u8>]) };
+    enc_into_uninit(
+        dest,
+        source_block_symbols,
+        |i| intermediate_symbols.get(i),
+        source_tuple,
+    );
+}
+
+/// Enc[] (section 5.3.5.3): the encoding symbol of `source_tuple` over the
+/// intermediate symbols `intermediate(0..L)`, written into `dest`, which
+/// may be uninitialized. The first term is copied in through a raw pointer;
+/// only then, with every byte of `dest` written, is it read as `&mut [u8]`
+/// to add the other terms.
+#[allow(clippy::many_single_char_names)]
+pub(crate) fn enc_into_uninit<'a>(
+    dest: &mut [MaybeUninit<u8>],
+    source_block_symbols: u32,
+    intermediate: impl Fn(usize) -> &'a [u8],
     source_tuple: (u32, u32, u32, u32, u32, u32),
 ) {
     let w = num_lt_symbols(source_block_symbols);
@@ -516,24 +540,32 @@ pub(crate) fn enc_into(
     assert!(1 <= a1 && a1 < p1);
     assert!(b1 < p1);
 
-    dest.copy_from_slice(intermediate_symbols.get(b as usize));
+    let first = intermediate(b as usize);
+    assert_eq!(first.len(), dest.len());
+    // SAFETY: `first` is `dest.len()` bytes, and `dest` is borrowed mutably,
+    // so the two do not overlap.
+    unsafe {
+        core::ptr::copy_nonoverlapping(first.as_ptr(), dest.as_mut_ptr().cast::<u8>(), dest.len());
+    }
+    // SAFETY: every byte of `dest` was written just above.
+    let dest = unsafe { &mut *(dest as *mut [MaybeUninit<u8>] as *mut [u8]) };
     for _ in 1..d {
         b = (b + a) % w;
-        add_assign(dest, intermediate_symbols.get(b as usize));
+        add_assign(dest, intermediate(b as usize));
     }
 
     while b1 >= p {
         b1 = (b1 + a1) % p1;
     }
 
-    add_assign(dest, intermediate_symbols.get((w + b1) as usize));
+    add_assign(dest, intermediate((w + b1) as usize));
 
     for _ in 1..d1 {
         b1 = (b1 + a1) % p1;
         while b1 >= p {
             b1 = (b1 + a1) % p1;
         }
-        add_assign(dest, intermediate_symbols.get((w + b1) as usize));
+        add_assign(dest, intermediate((w + b1) as usize));
     }
 }
 

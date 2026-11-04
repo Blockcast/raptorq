@@ -23,6 +23,7 @@ mod decoder;
 mod encoder;
 mod gf2;
 mod graph;
+mod inplace_encoder;
 mod iterators;
 mod matrix;
 mod octet;
@@ -60,6 +61,7 @@ pub use crate::encoder::EncoderBuilder;
 pub use crate::encoder::SourceBlockEncoder;
 pub use crate::encoder::SourceBlockEncodingPlan;
 pub use crate::encoder::calculate_block_offsets;
+pub use crate::inplace_encoder::{EncodingPlanMemo, InPlaceBlockEncoder};
 #[cfg(feature = "python")]
 pub use crate::python::Decoder;
 #[cfg(feature = "python")]
