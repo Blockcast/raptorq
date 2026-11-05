@@ -180,6 +180,38 @@ fn matches_encoder_with_long_and_short_blocks() {
     }
 }
 
+/// Small symbols whose sub-blocks are uneven (long and short) or empty
+/// (N > T / Al), which the T 1312 matrix never produces.
+#[test]
+fn matches_encoder_with_uneven_and_empty_sub_blocks() {
+    for (t, n, al) in [(24u16, 3u16, 4u8), (12, 5, 1), (8, 9, 1), (40, 3, 8)] {
+        let ks: &[u32] = if FULL {
+            &[1, 2, 7, 20, 300]
+        } else {
+            &[1, 2, 7, 20]
+        };
+        for &k in ks {
+            for z in [1u8, 2] {
+                let total = k as usize * usize::from(z) * usize::from(t);
+                for short in [0, 1, usize::from(t) - 1, usize::from(t) + 3] {
+                    if short >= total || (total - short).div_ceil(usize::from(t)) < usize::from(z) {
+                        continue;
+                    }
+                    let len = total - short;
+                    let bytes = data(len, u64::from(t) << 40 | u64::from(k) << 8 | short as u64);
+                    let config = ObjectTransmissionInformation::new(len as u64, t, z, n, al);
+                    let classic = Encoder::new(&bytes, config);
+                    let object = ObjectEncoder::new(&bytes, config).unwrap();
+                    assert!(
+                        classic_packets(&classic, 0) == object_packets(&object, 0),
+                        "T={t} N={n} Al={al} k={k} Z={z} F=kZT-{short}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn packets_into_checks_its_arguments() {
     let bytes = data(3 * usize::from(T), 1);

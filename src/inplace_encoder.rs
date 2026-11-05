@@ -526,8 +526,7 @@ impl InPlaceBlockEncoder {
 
 /// Zero uninitialized bytes.
 fn zero(bytes: &mut [MaybeUninit<u8>]) {
-    // SAFETY: `bytes` is `bytes.len()` writable bytes.
-    unsafe { ptr::write_bytes(bytes.as_mut_ptr(), 0, bytes.len()) };
+    bytes.fill(MaybeUninit::new(0));
 }
 
 /// S + H of K'(k): the rows of D in front of the source symbols.
