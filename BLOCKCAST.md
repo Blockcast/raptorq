@@ -91,7 +91,9 @@ In order, oldest first:
    zeroes its S + H and K' - k rows and the zero extension once, writes each
    source byte once into its row of D (gathering sub-symbols when N > 1),
    replays the plan and closes the block. No `padded` copy, no calloc, no
-   source copy kept; symbols come from `symbols_into`. Plans for K' <= 257
+   source copy kept; symbols come from `symbols_into`, and serialized packets
+   (4-byte PayloadId + symbol) from `ObjectEncoder::packets_into`, straight
+   into an uninitialized caller buffer. Plans for K' <= 257
    come from the store (`OnceLock<Mutex<EncodingPlanMemo>>`, `std` only):
    at most the 46 plans for those K', 5,291,880 bytes on 64-bit targets,
    its byte budget; generated once per process for each K', never evicted,

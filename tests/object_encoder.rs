@@ -50,6 +50,25 @@ fn object_packets(encoder: &ObjectEncoder, first_repair: u32) -> Vec<EncodingPac
     packets
 }
 
+/// The same packets through `packets_into`, as serialized bytes.
+fn object_records(encoder: &ObjectEncoder, first_repair: u32) -> Vec<u8> {
+    let record = 4 + usize::from(encoder.config().symbol_size());
+    let mut bytes = vec![];
+    for (sbn, block) in encoder.blocks().iter().enumerate() {
+        let k = block.closed_source_symbols().unwrap();
+        for (first, count) in [(0, k), (k + first_repair, REPAIR)] {
+            // One spare byte past the records must stay untouched.
+            let mut out = vec![MaybeUninit::new(0xA5u8); count as usize * record + 1];
+            let n = encoder.packets_into(sbn, first, count, &mut out).unwrap();
+            assert_eq!(n, count as usize * record);
+            // SAFETY: every byte was initialized above.
+            assert_eq!(unsafe { out[n].assume_init() }, 0xA5);
+            bytes.extend(out[..n].iter().map(|b| unsafe { b.assume_init() }));
+        }
+    }
+    bytes
+}
+
 fn classic_packets(encoder: &Encoder, first_repair: u32) -> Vec<EncodingPacket> {
     let mut packets = vec![];
     for block in encoder.get_block_encoders() {
@@ -73,9 +92,15 @@ fn check(k: u32, z: u8, n: u16, short: usize) {
     assert_eq!(object.blocks().len(), usize::from(z));
     assert_eq!(object.source_symbol_count(), k * u32::from(z));
     for first_repair in [0, 3] {
+        let expected = classic_packets(&classic, first_repair);
         assert!(
-            classic_packets(&classic, first_repair) == object_packets(&object, first_repair),
+            expected == object_packets(&object, first_repair),
             "k={k} Z={z} N={n} F=kT-{short} first_repair={first_repair}"
+        );
+        let serialized: Vec<u8> = expected.iter().flat_map(|p| p.serialize()).collect();
+        assert!(
+            serialized == object_records(&object, first_repair),
+            "records: k={k} Z={z} N={n} F=kT-{short} first_repair={first_repair}"
         );
     }
 }
@@ -153,6 +178,19 @@ fn matches_encoder_with_long_and_short_blocks() {
             "Kt={kt} Z={z}"
         );
     }
+}
+
+#[test]
+fn packets_into_checks_its_arguments() {
+    let bytes = data(3 * usize::from(T), 1);
+    let config = ObjectTransmissionInformation::new(bytes.len() as u64, T, 1, 1, AL);
+    let object = ObjectEncoder::new(&bytes, config).unwrap();
+    let record = 4 + usize::from(T);
+    let mut out = vec![MaybeUninit::<u8>::uninit(); 2 * record];
+    assert!(object.packets_into(1, 0, 1, &mut out).is_err());
+    assert!(object.packets_into(0, 0, 3, &mut out).is_err());
+    assert_eq!(object.packets_into(0, 0, 0, &mut []), Ok(0));
+    assert_eq!(object.packets_into(0, 3, 2, &mut out), Ok(2 * record));
 }
 
 #[test]

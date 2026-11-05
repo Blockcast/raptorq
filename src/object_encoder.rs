@@ -1,14 +1,15 @@
 #[cfg(not(feature = "std"))]
 use alloc::{sync::Arc, vec::Vec};
+use core::mem::MaybeUninit;
 #[cfg(feature = "std")]
 use std::{sync::Arc, vec::Vec};
 
-use crate::base::{ObjectTransmissionInformation, partition};
+use crate::base::{ObjectTransmissionInformation, PayloadId, partition};
 use crate::encoder::SourceBlockEncodingPlan;
 #[cfg(feature = "std")]
 use crate::inplace_encoder::stored_plan;
 use crate::inplace_encoder::{EncodingPlanMemo, InPlaceBlockEncoder};
-use crate::reusable::{BlockError, check_source_symbols};
+use crate::reusable::{BlockError, check_source_symbols, strided_len};
 use crate::util::int_div_ceil;
 
 /// An RFC 6330 object encoder that builds each source block's D vector in
@@ -90,6 +91,47 @@ impl ObjectEncoder {
     /// repair symbol r).
     pub fn blocks(&self) -> &[InPlaceBlockEncoder] {
         &self.blocks
+    }
+
+    /// Write `count` serialized [`EncodingPacket`](crate::EncodingPacket)s
+    /// of source block `block`, ESIs `first_esi`, `first_esi + 1`, ..., into
+    /// `out`, back to back: each record is its 4-byte
+    /// [`PayloadId`] then its T-byte symbol, exactly the bytes of
+    /// `EncodingPacket::serialize`. ESIs below k are source packets, ESI
+    /// k + r repair symbol r. Returns the bytes written, `count * (4 + T)`.
+    /// `out` may be uninitialized; nothing past the records is touched.
+    ///
+    /// # Errors
+    /// [`BlockError::NoBlock`] if there is no block `block`, and the errors
+    /// of [`InPlaceBlockEncoder::symbols_into`] (with the record stride). On
+    /// error nothing is written.
+    pub fn packets_into(
+        &self,
+        block: usize,
+        first_esi: u32,
+        count: u32,
+        out: &mut [MaybeUninit<u8>],
+    ) -> Result<usize, BlockError> {
+        let encoder = self.blocks.get(block).ok_or(BlockError::NoBlock)?;
+        let record = 4 + usize::from(self.config.symbol_size());
+        let len = strided_len(count as usize, record, record)?;
+        if count == 0 {
+            return Ok(0);
+        }
+        if out.len() < len {
+            return Err(BlockError::BufferTooSmall {
+                len: out.len(),
+                needed: len,
+            });
+        }
+        encoder.symbols_into(first_esi, count, &mut out[4..len], record)?;
+        for (i, header) in out[..len].chunks_exact_mut(record).enumerate() {
+            let id = PayloadId::new(block as u8, first_esi + i as u32).serialize();
+            for (dst, byte) in header.iter_mut().zip(id) {
+                dst.write(byte);
+            }
+        }
+        Ok(len)
     }
 }
 
