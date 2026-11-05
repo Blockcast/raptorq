@@ -67,7 +67,10 @@ jobs:
       # FULL (`!cfg!(debug_assertions)`) runs only optimized: the production
       # sizes, the sparse-solver K and the K=256 in-place encoder cases.
       - name: Run reusable codec tests (release)
-        run: cargo test --release --test reusable_codec --test reusable_alloc
+        run: cargo test --release --test reusable_codec --test reusable_alloc --test object_encoder
+
+      - name: Run object encoder tests (release, no-std)
+        run: cargo test --release --no-default-features --test object_encoder
 
       - name: Compile benchmarks
         run: cargo bench --features benchmarking --no-run
