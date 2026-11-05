@@ -50,8 +50,8 @@ In order, oldest first:
    extended size K' into its own storage (a plan depends only on K', so one
    plan serves every K with that K'). Plans come from the attached plan or
    from a per-encoder memo that keeps the plan it generates for each new K'
-   (byte budget, 4 MiB by default, never evicts; the process-wide cache is
-   not touched). Encoding and symbol generation therefore allocate nothing
+   (byte budget, 4 MiB by default, never evicts; neither the process-wide
+   cache nor the K' plan store of patch 7 is touched). Encoding and symbol generation therefore allocate nothing
    once each K' has been seen and its plan is kept, including the short
    final block of every object, as long as the memo's budget holds those
    plans. The default 4 MiB (`DEFAULT_PLAN_MEMO_BYTES`) holds plans for every
@@ -82,6 +82,28 @@ In order, oldest first:
    each K' has a plan nothing allocates. Tests: the in-place arms of
    `tests/reusable_codec.rs` (against `SourceBlockEncoder`, full and short
    closes) and `tests/reusable_alloc.rs`. CI runs both in release too.
+7. **Whole-object in-place encoder** (`src/object_encoder.rs`):
+   `ObjectEncoder`, plus `InPlaceBlockEncoder::from_source_block` and a
+   process-wide plan store keyed by K'. Additive: no existing type or
+   signature changes. `ObjectEncoder::new(data, config)` partitions the
+   object as `Encoder::new` does and builds each source block with
+   `from_source_block`, which allocates its L(k) * T slab uninitialized,
+   zeroes its S + H and K' - k rows and the zero extension once, writes each
+   source byte once into its row of D (gathering sub-symbols when N > 1),
+   replays the plan and closes the block. No `padded` copy, no calloc, no
+   source copy kept; symbols come from `symbols_into`. Plans for K' <= 257
+   come from the store (`OnceLock<Mutex<EncodingPlanMemo>>`, `std` only):
+   at most the 46 plans for those K', 5,291,880 bytes on 64-bit targets,
+   its byte budget; generated once per process for each K', never evicted,
+   and separate from the process-wide cache keyed by K (which evicts, and
+   whose full-block plans the store would otherwise evict). The lock is held
+   only to look up and insert. Above K' 257, and without `std`, an encoder
+   generates one plan per distinct K' in its object and keeps it for its
+   lifetime, as `Encoder::new` generates one per block size. Tests:
+   `tests/object_encoder.rs`, byte for byte against `Encoder` (source and
+   repair packets, Z 1-3, N 1/2/4, unaligned F, k 1-256, 300 and 1000; the
+   whole matrix in release, with and without `std`), and the store test in
+   `src/object_encoder.rs`.
 
 The old vendored copy also had some dead-code removals in `arraymap.rs`,
 `matrix.rs`, `sparse_matrix.rs` and `sparse_vec.rs`: `size_in_bytes` was gated

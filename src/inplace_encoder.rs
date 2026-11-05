@@ -1,13 +1,16 @@
 #[cfg(not(feature = "std"))]
 use alloc::{sync::Arc, vec::Vec};
 use core::mem::MaybeUninit;
+use core::ptr;
+#[cfg(feature = "std")]
+use std::sync::{Mutex, OnceLock};
 #[cfg(feature = "std")]
 use std::{sync::Arc, vec::Vec};
 
-use crate::base::intermediate_tuple;
+use crate::base::{ObjectTransmissionInformation, intermediate_tuple};
 use crate::encoder::{SourceBlockEncodingPlan, enc_into_uninit};
 use crate::operation_vector::SymbolOps;
-use crate::reusable::{BlockError, ESI_LIMIT, check_source_symbols, strided_len};
+use crate::reusable::{BlockError, ESI_LIMIT, SubBlockLayout, check_source_symbols, strided_len};
 use crate::symbol_slab::SymbolSlab;
 use crate::systematic_constants::{
     calculate_p1, extended_source_block_symbols, num_hdpc_symbols, num_intermediate_symbols,
@@ -92,7 +95,7 @@ impl EncodingPlanMemo {
 
     /// The plan for blocks of `source_symbols` symbols: the kept one, or a
     /// new one, kept if it fits.
-    fn plan_for(&mut self, source_symbols: u32) -> Arc<SourceBlockEncodingPlan> {
+    pub(crate) fn plan_for(&mut self, source_symbols: u32) -> Arc<SourceBlockEncodingPlan> {
         let extended = extended_source_block_symbols(source_symbols);
         if let Some(plan) = self.find(extended) {
             return Arc::clone(plan);
@@ -119,6 +122,58 @@ impl EncodingPlanMemo {
             self.bytes += bytes;
         }
     }
+}
+
+/// The largest K' the process-wide plan store keeps: K'(256).
+pub(crate) const STORE_MAX_EXTENDED_SYMBOLS: u32 = 257;
+
+/// The byte budget of the process-wide plan store: the 46 plans for
+/// K' <= 257, shrunk, measured on 64-bit targets.
+pub(crate) const STORE_BYTES: usize = 5_291_880;
+
+#[cfg(feature = "std")]
+fn plan_store() -> &'static Mutex<EncodingPlanMemo> {
+    static STORE: OnceLock<Mutex<EncodingPlanMemo>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(EncodingPlanMemo::new(STORE_BYTES)))
+}
+
+/// The process-wide plan for blocks of `source_symbols` symbols, keyed by
+/// K', generated on the first request for each K'. `None` above
+/// [`STORE_MAX_EXTENDED_SYMBOLS`]. The lock is held only to look up and to
+/// insert, never while a plan is generated; if two threads generate the same
+/// K', the first insert is kept.
+///
+/// Separate from [`SourceBlockEncodingPlan::cached`], which is keyed by K and
+/// evicts: whole-object plans there would evict the full-block plans its
+/// callers fetch.
+#[cfg(feature = "std")]
+pub(crate) fn stored_plan(source_symbols: u32) -> Option<Arc<SourceBlockEncodingPlan>> {
+    let extended = extended_source_block_symbols(source_symbols);
+    if extended > STORE_MAX_EXTENDED_SYMBOLS {
+        return None;
+    }
+    let lock = || {
+        plan_store()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    };
+    if let Some(plan) = lock().find(extended) {
+        return Some(Arc::clone(plan));
+    }
+    let plan = generate_plan(extended);
+    let mut store = lock();
+    if let Some(kept) = store.find(extended) {
+        return Some(Arc::clone(kept));
+    }
+    store.remember(extended, Arc::clone(&plan));
+    Some(plan)
+}
+
+/// The heap bytes and plan count of the process-wide plan store.
+#[cfg(all(feature = "std", test))]
+pub(crate) fn plan_store_usage() -> (usize, usize) {
+    let store = plan_store().lock().unwrap();
+    (store.heap_bytes(), store.len())
 }
 
 fn generate_plan(source_symbols: u32) -> Arc<SourceBlockEncodingPlan> {
@@ -231,6 +286,90 @@ impl InPlaceBlockEncoder {
             ),
             full_plan,
             closed: None,
+        })
+    }
+
+    /// A closed encoder for one source block of `source_symbols` (k)
+    /// symbols, built from its bytes: `data` is the block as laid out in the
+    /// object (RFC 6330 section 4.4.1.2, sub-blocks per `config`), zero
+    /// extended to k * T. `plan` must be a plan for K'(k).
+    ///
+    /// Each byte of `data` is written once, straight into its row of D; the
+    /// rest of D (its S + H and K' - k rows, and the zero extension) is
+    /// zeroed once. Nothing is calloc'd and no source copy is kept. The
+    /// encoder is equivalent to one built with [`new`](Self::new) of k,
+    /// filled and closed at k.
+    ///
+    /// # Errors
+    /// - [`BlockError::InvalidSourceSymbols`] if k is zero or above
+    ///   `MAX_SOURCE_SYMBOLS_PER_BLOCK`;
+    /// - [`BlockError::InvalidConfig`] if `config` cannot describe a source
+    ///   block or `plan` is not a plan for K'(k);
+    /// - [`BlockError::DataTooLong`] if `data` is longer than k * T.
+    pub fn from_source_block(
+        config: &ObjectTransmissionInformation,
+        source_symbols: u32,
+        data: &[u8],
+        plan: Arc<SourceBlockEncodingPlan>,
+    ) -> Result<Self, BlockError> {
+        check_source_symbols(source_symbols)?;
+        let layout = SubBlockLayout::new(config)?;
+        let extended = extended_source_block_symbols(source_symbols);
+        if extended_source_block_symbols(u32::from(plan.source_symbol_count())) != extended {
+            return Err(BlockError::InvalidConfig);
+        }
+        let t = layout.symbol_size();
+        let k = source_symbols as usize;
+        let front = front_rows(source_symbols);
+        let rows = num_intermediate_symbols(source_symbols) as usize;
+        let (Some(block_len), Some(slab_len)) = (k.checked_mul(t), rows.checked_mul(t)) else {
+            return Err(BlockError::InvalidConfig);
+        };
+        if data.len() > block_len {
+            return Err(BlockError::DataTooLong {
+                len: data.len(),
+                max: block_len,
+            });
+        }
+        let mut bytes = Vec::with_capacity(slab_len);
+        {
+            let (head, rest) = bytes.spare_capacity_mut()[..slab_len].split_at_mut(front * t);
+            let (source, tail) = rest.split_at_mut(block_len);
+            zero(head);
+            zero(tail);
+            let mut written = 0;
+            layout.for_each_run(k, 0, data.len(), |from, to, len| {
+                let dest = &mut source[to..to + len];
+                // SAFETY: `dest` is `len` writable bytes that do not overlap
+                // `data`, which is borrowed immutably.
+                unsafe {
+                    ptr::copy_nonoverlapping(data[from..].as_ptr(), dest.as_mut_ptr().cast(), len)
+                };
+                written += len;
+            });
+            layout.for_each_run(k, data.len(), block_len, |_, to, len| {
+                zero(&mut source[to..to + len]);
+                written += len;
+            });
+            // The runs of [0, k * T) cover every source byte exactly once.
+            assert_eq!(written, block_len);
+        }
+        // SAFETY: the head, every source byte and the tail were initialized
+        // above, and together they are the first `slab_len` bytes.
+        unsafe { bytes.set_len(slab_len) };
+        let mut slab = SymbolSlab::from_bytes(bytes, t);
+        replay(row_operations(&plan), 0, &mut slab);
+        Ok(InPlaceBlockEncoder {
+            symbol_size: t,
+            max_source_symbols: source_symbols,
+            offset: front,
+            slab,
+            full_plan: Arc::clone(&plan),
+            closed: Some(Closed {
+                source_symbols,
+                base: 0,
+                plan,
+            }),
         })
     }
 
@@ -383,6 +522,12 @@ impl InPlaceBlockEncoder {
     fn intermediate(&self, closed: &Closed, j: usize) -> &[u8] {
         self.slab.get(closed.base + reorder(&closed.plan)[j])
     }
+}
+
+/// Zero uninitialized bytes.
+fn zero(bytes: &mut [MaybeUninit<u8>]) {
+    // SAFETY: `bytes` is `bytes.len()` writable bytes.
+    unsafe { ptr::write_bytes(bytes.as_mut_ptr(), 0, bytes.len()) };
 }
 
 /// S + H of K'(k): the rows of D in front of the source symbols.
