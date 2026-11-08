@@ -2,7 +2,7 @@ name: CI
 
 on:
   pull_request:
-  push: # required for actions/cache to work
+  push:
     branches:
       - master
 
@@ -19,9 +19,21 @@ jobs:
 
     steps:
       - uses: actions/checkout@v2
-      - name: Cache
+      - name: Restore Rust cache
         id: rust-cache
-        uses: actions/cache@v3
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml', '.github/workflows/*.yml', 'rust-toolchain') }}
+
+      - name: Save Rust cache
+        if: ${{ success() && (github.event_name == 'push' || github.event_name == 'schedule') && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: |
             ~/.cargo/bin/
