@@ -2,9 +2,10 @@ name: CI
 
 on:
   pull_request:
-  push: # required for actions/cache to work
+  push:
     branches:
       - master
+      - blockcast
 
 jobs:
   ci:
@@ -19,9 +20,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v2
-      - name: Cache
+      - name: Restore Rust cache
         id: rust-cache
-        uses: actions/cache@v3
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: |
             ~/.cargo/bin/
@@ -29,7 +30,9 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml', '.github/workflows/*.yml', 'rust-toolchain') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.toml', '.github/workflows/*.yml', 'rust-toolchain') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-
 
       - name: Install Python
         uses: actions/setup-python@v4
@@ -86,3 +89,15 @@ jobs:
           pip3 install --upgrade pip
           pip3 install maturin
           just test_py
+
+      - name: Save Rust cache
+        if: ${{ success() && steps.rust-cache.outputs.cache-hit != 'true' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
